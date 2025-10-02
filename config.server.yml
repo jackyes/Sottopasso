@@ -1,0 +1,42 @@
+# Configuration file for the Tunnel Server
+
+# Address for the client control channel (TLS)
+control_addr: ":7780"
+
+# Address for public HTTP/HTTPS traffic
+http_addr: ":8001"
+
+# Enable TLS for public traffic (HTTPS)
+http_use_tls: true
+
+# Base domain used to generate HTTP tunnel URLs
+domain: "test.xxxx.com:8001"
+
+# Paths for the control channel TLS certificate and key files.
+tls_cert_file: "/etc/letsencrypt/live/test.xxxx.com/fullchain.pem"
+tls_key_file: "/etc/letsencrypt/live/test.xxxx.com/privkey.pem"
+
+# List of valid authentication tokens for clients
+valid_tokens:
+  - "secret-token-1"
+  - "secret-token-2"
+
+# Keepalive interval for the connection (e.g., 30s, 1m, 1h)
+keepalive_interval: "30s"
+
+# Write timeout for the connection (e.g., 10s, 1m)
+connection_write_timeout: "500s"
+
+# --- Status Dashboard Configuration ---
+
+# Address for the status dashboard (e.g., ":4040")
+dashboard_addr: ":4040"
+
+# (Optional) Credentials to protect dashboard access with Basic Auth
+dashboard_username: "admin"
+dashboard_password: "sottopasso"
+
+# (Optional) Paths for dashboard TLS files. If omitted, the dashboard will be HTTP.
+# If not found, they will be automatically generated.
+dashboard_tls_cert_file: "/etc/letsencrypt/live/test.xxxx.com/fullchain.pem"
+dashboard_tls_key_file: "/etc/letsencrypt/live/test.xxxx.com/privkey.pem"

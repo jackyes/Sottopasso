@@ -1,0 +1,26 @@
+# Configuration file for the Tunnel Client
+
+# Address of the server to connect to (TLS connection)
+server_addr: "xxxx.com:7780"
+
+# Authentication token to use for the connection
+auth_token: "secret-token-1"
+
+# If true, the client will not verify the validity of the server's TLS certificate.
+# Useful for development with self-signed certificates.
+insecure_skip_verify: true
+
+# Protocol to forward (http or tcp)
+tunnel_protocol: "http"
+
+# Local port to expose
+local_port: 8080
+
+# Requested subdomain (optional, only for http tunnels)
+subdomain: "test"
+
+# Keepalive interval for the connection (e.g., 30s, 1m, 1h)
+keepalive_interval: "30s"
+
+# Write timeout for the connection (e.g., 10s, 1m)
+connection_write_timeout: "500s"
