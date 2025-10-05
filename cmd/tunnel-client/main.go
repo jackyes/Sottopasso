@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -37,6 +38,31 @@ func main() {
 	keepaliveInterval := flag.String("keepalive-interval", "", "Keepalive interval (e.g., 30s, 1m). Overrides config.")
 	connectionWriteTimeout := flag.String("connection-write-timeout", "", "Connection write timeout (e.g., 10s, 1m). Overrides config.")
 	flag.Parse()
+
+	// Handle positional arguments: tunnel-client [protocol] [port]
+	// Only process positional arguments if no tunnel-related flags were provided
+	args := flag.Args()
+	if len(args) == 1 {
+		// Single argument could be "help" or other command
+		if args[0] == "help" {
+			flag.Usage()
+			os.Exit(0)
+		}
+		// If it's not help and we're missing tunnel config, show error
+		if *tunnelType == "" || *localPort == 0 {
+			log.Fatal("Both protocol and port must be provided as positional arguments, or use flags. Use --help for usage.")
+		}
+	} else if len(args) >= 2 && *tunnelType == "" && *localPort == 0 {
+		// If protocol and port are provided as positional arguments and no flags were set, use them
+		*tunnelType = args[0]
+		port, err := strconv.Atoi(args[1])
+		if err != nil {
+			log.Fatalf("Invalid port number: %v", err)
+		}
+		*localPort = port
+	} else if len(args) > 0 && (*tunnelType != "" || *localPort != 0) {
+		log.Printf("Warning: Ignoring positional arguments because flags were provided")
+	}
 
 	// Load configuration from YAML
 	configYAML := ConfigYAML{
