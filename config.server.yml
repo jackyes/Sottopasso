@@ -27,6 +27,21 @@ keepalive_interval: "30s"
 # Write timeout for the connection (e.g., 10s, 1m)
 connection_write_timeout: "500s"
 
+# --- Connection Pool Configuration ---
+# Connection pooling settings for improved performance
+connection_pool:
+  max_size: 100           # Maximum number of streams in the pool
+  idle_timeout: "30s"     # How long an idle stream stays in the pool
+  max_idle: 20            # Maximum number of idle streams
+
+# --- Buffer Pool Configuration ---
+# Buffer pooling settings for memory optimization
+buffer_pool:
+  small_buffer_size: 4096     # 4KB buffers for small operations
+  medium_buffer_size: 16384   # 16KB buffers for medium operations
+  large_buffer_size: 65536    # 64KB buffers for UDP and large transfers
+
+
 # --- Status Dashboard Configuration ---
 
 # Address for the status dashboard (e.g., ":4040")
@@ -40,3 +55,25 @@ dashboard_password: "sottopasso"
 # If not found, they will be automatically generated.
 dashboard_tls_cert_file: "/etc/letsencrypt/live/test.xxxx.com/fullchain.pem"
 dashboard_tls_key_file: "/etc/letsencrypt/live/test.xxxx.com/privkey.pem"
+
+# --- TLS Session Resumption Configuration ---
+# Settings for TLS performance optimization through session resumption
+tls_config:
+  enable_session_resumption: true    # Enable TLS session resumption for improved performance
+  session_cache_ttl: "24h"           # How long sessions remain in cache (e.g., 1h, 24h)
+  max_cache_size: 1000               # Maximum number of sessions to cache
+  key_rotation_interval: "24h"       # How often to rotate session ticket keys
+
+# --- Metrics Configuration ---
+# Settings for performance metrics collection
+metrics_config:
+  enabled: true                      # Enable metrics collection
+  collection_interval: "30s"         # How often to collect metrics
+  retention_period: "24h"            # How long to keep metrics data
+  enable_detailed_metrics: true      # Enable detailed per-tunnel metrics
+  enable_connection_pool_stats: true # Enable connection pool statistics
+  enable_buffer_pool_stats: true     # Enable buffer pool statistics
+  enable_system_metrics: true        # Enable system-level metrics
+  enable_latency_histograms: true    # Enable latency distribution tracking
+  max_histogram_buckets: 50          # Maximum number of histogram buckets
+  metrics_endpoint: "/metrics"       # Endpoint for metrics exposure
