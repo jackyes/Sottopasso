@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -221,14 +222,27 @@ func (s BufferPoolStats) ReuseRate() float64 {
 var (
 	globalBufferPool     *BufferPool
 	globalBufferPoolOnce sync.Once
+	globalBufferPoolInit bool
 )
 
 // GetGlobalBufferPool returns the global buffer pool instance
 func GetGlobalBufferPool() *BufferPool {
 	globalBufferPoolOnce.Do(func() {
 		globalBufferPool = NewBufferPool(DefaultBufferPoolConfig())
+		globalBufferPoolInit = true
 	})
 	return globalBufferPool
+}
+
+// InitGlobalBufferPool initializes the global buffer pool with custom configuration
+// This must be called before GetGlobalBufferPool() if custom configuration is needed
+func InitGlobalBufferPool(config BufferPoolConfig) {
+	if globalBufferPoolInit {
+		log.Printf("Warning: Global buffer pool already initialized, ignoring custom configuration")
+		return
+	}
+	globalBufferPool = NewBufferPool(config)
+	globalBufferPoolInit = true
 }
 
 // BufferedCopy performs a buffered copy between two connections with deadlines
