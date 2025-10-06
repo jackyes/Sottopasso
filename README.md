@@ -47,50 +47,28 @@ Create this file in the same directory as the `tunnel-server.exe` executable.
 # Configuration file for the Tunnel Server
 
 # Address for the client control channel (TLS)
-control_addr: ":7780"
+control_addr: ":8080"
 
 # Address for public HTTP/HTTPS traffic
 http_addr: ":8001"
 
-# Enable TLS for public traffic (HTTPS)
-http_use_tls: true
-
 # Base domain used to generate HTTP tunnel URLs
-domain: "test.xxxx.com:8001"
+# For a public server, use a real domain (e.g., "tunnel.yourdomain.com")
+domain: "localhost:8001"
 
 # Paths for the control channel TLS certificate and key files.
-tls_cert_file: "/etc/letsencrypt/live/test.xxxx.com/fullchain.pem"
-tls_key_file: "/etc/letsencrypt/live/test.xxxx.com/privkey.pem"
+# If not found, they will be automatically generated.
+tls_cert_file: "cert.pem"
+tls_key_file: "key.pem"
 
 # List of valid authentication tokens for clients
 valid_tokens:
   - "secret-token-1"
   - "secret-token-2"
 
-# Keepalive interval for the connection (e.g., 30s, 1m, 1h)
-keepalive_interval: "30s"
-
-# Write timeout for the connection (e.g., 10s, 1m)
-connection_write_timeout: "500s"
-
-# --- Connection Pool Configuration ---
-# Connection pooling settings for improved performance
-connection_pool:
-  max_size: 100           # Maximum number of streams in the pool
-  idle_timeout: "30s"     # How long an idle stream stays in the pool
-  max_idle: 20            # Maximum number of idle streams
-
-# --- Buffer Pool Configuration ---
-# Buffer pooling settings for memory optimization
-buffer_pool:
-  small_buffer_size: 4096     # 4KB buffers for small operations
-  medium_buffer_size: 16384   # 16KB buffers for medium operations
-  large_buffer_size: 65536    # 64KB buffers for UDP and large transfers
-
-
 # --- Status Dashboard Configuration ---
 
-# Address for the status dashboard (e.g., ":4040")
+# Address for the status dashboard (e.g., ":4040"). Leave empty to disable.
 dashboard_addr: ":4040"
 
 # (Optional) Credentials to protect dashboard access with Basic Auth
@@ -99,30 +77,8 @@ dashboard_password: "sottopasso"
 
 # (Optional) Paths for dashboard TLS files. If omitted, the dashboard will be HTTP.
 # If not found, they will be automatically generated.
-dashboard_tls_cert_file: "/etc/letsencrypt/live/test.xxxx.com/fullchain.pem"
-dashboard_tls_key_file: "/etc/letsencrypt/live/test.xxxx.com/privkey.pem"
-
-# --- TLS Session Resumption Configuration ---
-# Settings for TLS performance optimization through session resumption
-tls_config:
-  enable_session_resumption: true    # Enable TLS session resumption for improved performance
-  session_cache_ttl: "24h"           # How long sessions remain in cache (e.g., 1h, 24h)
-  max_cache_size: 1000               # Maximum number of sessions to cache
-  key_rotation_interval: "24h"       # How often to rotate session ticket keys
-
-# --- Metrics Configuration ---
-# Settings for performance metrics collection
-metrics_config:
-  enabled: true                      # Enable metrics collection
-  collection_interval: "30s"         # How often to collect metrics
-  retention_period: "24h"            # How long to keep metrics data
-  enable_detailed_metrics: true      # Enable detailed per-tunnel metrics
-  enable_connection_pool_stats: true # Enable connection pool statistics
-  enable_buffer_pool_stats: true     # Enable buffer pool statistics
-  enable_system_metrics: true        # Enable system-level metrics
-  enable_latency_histograms: true    # Enable latency distribution tracking
-  max_histogram_buckets: 50          # Maximum number of histogram buckets
-  metrics_endpoint: "/metrics"       # Endpoint for metrics exposure
+dashboard_tls_cert_file: "dashboard.cert.pem"
+dashboard_tls_key_file: "dashboard.key.pem"
 ```
 
 ### Client (`config.client.yml`)
@@ -133,48 +89,14 @@ Create this file in the same directory as the `tunnel-client.exe` executable.
 # Configuration file for the Tunnel Client
 
 # Address of the server to connect to (TLS connection)
-server_addr: "xxxx.com:7780"
+server_addr: "127.0.0.1:8080"
 
 # Authentication token to use for the connection
 auth_token: "secret-token-1"
 
 # If true, the client will not verify the validity of the server's TLS certificate.
-# Useful for development with self-signed certificates.
-insecure_skip_verify: false
-
-# Protocol to forward (http or tcp)
-tunnel_protocol: "http"
-
-# Local port to expose
-local_port: 8080
-
-# Requested subdomain (optional, only for http tunnels)
-subdomain: "test"
-
-# Keepalive interval for the connection (e.g., 30s, 1m, 1h)
-keepalive_interval: "30s"
-
-# Write timeout for the connection (e.g., 10s, 1m)
-connection_write_timeout: "500s"
-
-# --- Connection Pool Configuration ---
-# Connection pooling settings for improved performance
-connection_pool:
-  max_size: 100           # Maximum number of streams in the pool
-  idle_timeout: "30s"     # How long an idle stream stays in the pool
-  max_idle: 20            # Maximum number of idle streams
-
-# --- Buffer Pool Configuration ---
-# Buffer pooling settings for memory optimization
-buffer_pool:
-  small_buffer_size: 4096     # 4KB buffers for small operations
-  medium_buffer_size: 16384   # 16KB buffers for medium operations
-  large_buffer_size: 65536    # 64KB buffers for UDP and large transfers
-
-# --- TLS Session Resumption Configuration ---
-# Settings for TLS performance optimization through session resumption
-tls_config:
-  enable_session_resumption: true    # Enable TLS session resumption for improved performance
+# REQUIRED for development with self-signed certificates.
+insecure_skip_verify: true
 ```
 
 ## Usage

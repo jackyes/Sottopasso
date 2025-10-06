@@ -8,7 +8,7 @@ auth_token: "secret-token-1"
 
 # If true, the client will not verify the validity of the server's TLS certificate.
 # Useful for development with self-signed certificates.
-insecure_skip_verify: false
+insecure_skip_verify: true
 
 # Protocol to forward (http or tcp)
 tunnel_protocol: "http"
@@ -24,22 +24,3 @@ keepalive_interval: "30s"
 
 # Write timeout for the connection (e.g., 10s, 1m)
 connection_write_timeout: "500s"
-
-# --- Connection Pool Configuration ---
-# Connection pooling settings for improved performance
-connection_pool:
-  max_size: 100           # Maximum number of streams in the pool
-  idle_timeout: "30s"     # How long an idle stream stays in the pool
-  max_idle: 20            # Maximum number of idle streams
-
-# --- Buffer Pool Configuration ---
-# Buffer pooling settings for memory optimization
-buffer_pool:
-  small_buffer_size: 4096     # 4KB buffers for small operations
-  medium_buffer_size: 16384   # 16KB buffers for medium operations
-  large_buffer_size: 65536    # 64KB buffers for UDP and large transfers
-
-# --- TLS Session Resumption Configuration ---
-# Settings for TLS performance optimization through session resumption
-tls_config:
-  enable_session_resumption: true    # Enable TLS session resumption for improved performance

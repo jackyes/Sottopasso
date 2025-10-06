@@ -2,7 +2,6 @@ package main
 
 import (
 	"Sottopasso/pkg/client"
-	"Sottopasso/pkg/pool"
 	"flag"
 	"io/ioutil"
 	"log"
@@ -25,24 +24,6 @@ type ConfigYAML struct {
 	Subdomain              string `yaml:"subdomain"`
 	KeepaliveInterval      string `yaml:"keepalive_interval"`
 	ConnectionWriteTimeout string `yaml:"connection_write_timeout"`
-
-	// Buffer pool configuration
-	BufferPool BufferPoolConfig `yaml:"buffer_pool"`
-
-	// TLS configuration
-	TLSConfig TLSConfigYAML `yaml:"tls_config"`
-}
-
-// TLSConfigYAML holds TLS configuration from YAML
-type TLSConfigYAML struct {
-	EnableSessionResumption bool `yaml:"enable_session_resumption"`
-}
-
-// BufferPoolConfig holds configuration for the buffer pool
-type BufferPoolConfig struct {
-	SmallBufferSize  int `yaml:"small_buffer_size"`
-	MediumBufferSize int `yaml:"medium_buffer_size"`
-	LargeBufferSize  int `yaml:"large_buffer_size"`
 }
 
 func main() {
@@ -91,14 +72,6 @@ func main() {
 		LocalPort:              8080,   // Default value
 		KeepaliveInterval:      "30s",  // Default value
 		ConnectionWriteTimeout: "10s",  // Default value
-		BufferPool: BufferPoolConfig{
-			SmallBufferSize:  4096,  // 4KB
-			MediumBufferSize: 16384, // 16KB
-			LargeBufferSize:  65536, // 64KB
-		},
-		TLSConfig: TLSConfigYAML{
-			EnableSessionResumption: true, // Default value
-		},
 	}
 	yamlFile, err := ioutil.ReadFile(*configPath)
 	if err == nil {
@@ -161,22 +134,11 @@ func main() {
 		InsecureSkipVerify:     configYAML.InsecureSkipVerify,
 		KeepaliveInterval:      keepalive,
 		ConnectionWriteTimeout: writeTimeout,
-		TLSConfig: client.TLSConfig{
-			EnableSessionResumption: configYAML.TLSConfig.EnableSessionResumption,
-		},
 	}
 
 	if config.AuthToken == "" {
 		log.Fatal("Authentication token is required.")
 	}
-
-	// Initialize global buffer pool with configuration
-	bufferPoolConfig := pool.BufferPoolConfig{
-		SmallBufferSize:  configYAML.BufferPool.SmallBufferSize,
-		MediumBufferSize: configYAML.BufferPool.MediumBufferSize,
-		LargeBufferSize:  configYAML.BufferPool.LargeBufferSize,
-	}
-	pool.InitGlobalBufferPool(bufferPoolConfig)
 
 	cli := client.New(config)
 
