@@ -34,6 +34,7 @@ type Tunnel struct {
 	ID            string         `json:"id"`
 	Type          string         `json:"type"`
 	PublicURL     string         `json:"public_url"`
+	ClientAddr    string         `json:"client_addr"`
 	Status        string         `json:"status"`
 	CreatedAt     time.Time      `json:"created_at"`
 	TotalBytesIn  atomic.Uint64  `json:"total_bytes_in"`
@@ -200,6 +201,11 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 
 // serveDashboard è l'handler per la pagina di stato.
 func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		s.handleCloseTunnel(w, r)
+		return
+	}
+
 	s.tunnelsMu.RLock()
 	defer s.tunnelsMu.RUnlock()
 
@@ -221,6 +227,9 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 			mb := kb / unit
 			return fmt.Sprintf("%.2f MB", mb)
 		},
+		"duration": func(d time.Time) string {
+			return time.Since(d).Round(time.Second).String()
+		},
 	}).Parse(dashboardTemplate)
 
 	if err != nil {
@@ -231,6 +240,29 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tmpl.Execute(w, tunnels)
+}
+
+// handleCloseTunnel gestisce la richiesta di chiusura di un tunnel.
+func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
+	tunnelID := r.FormValue("tunnelId")
+	if tunnelID == "" {
+		http.Error(w, "ID tunnel non fornito", http.StatusBadRequest)
+		return
+	}
+
+	s.tunnelsMu.RLock()
+	tunnel, ok := s.tunnels[tunnelID]
+	s.tunnelsMu.RUnlock()
+
+	if !ok {
+		http.Error(w, "Tunnel non trovato", http.StatusNotFound)
+		return
+	}
+
+	log.Printf("Chiusura del tunnel %s su richiesta dalla dashboard", tunnelID)
+	tunnel.Session.Close()
+
+	http.Redirect(w, r, r.Header.Get("Referer"), http.StatusFound)
 }
 
 // getTLSConfig carica o genera una configurazione TLS.
@@ -545,12 +577,13 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	}
 
 	tunnel := &Tunnel{
-		ID:        uuid.New().String(),
-		Type:      "http",
-		PublicURL: fmt.Sprintf("%s://%s", schema, host),
-		Status:    "active",
-		CreatedAt: time.Now(),
-		Session:   session,
+		ID:         uuid.New().String(),
+		Type:       "http",
+		PublicURL:  fmt.Sprintf("%s://%s", schema, host),
+		ClientAddr: session.RemoteAddr().String(),
+		Status:     "active",
+		CreatedAt:  time.Now(),
+		Session:    session,
 	}
 
 	s.tunnelsMu.Lock()
@@ -578,12 +611,13 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 
 	publicAddr := listener.Addr().String()
 	tunnel := &Tunnel{
-		ID:        uuid.New().String(),
-		Type:      "tcp",
-		PublicURL: publicAddr,
-		Status:    "active",
-		CreatedAt: time.Now(),
-		Session:   session,
+		ID:         uuid.New().String(),
+		Type:       "tcp",
+		PublicURL:  publicAddr,
+		ClientAddr: session.RemoteAddr().String(),
+		Status:     "active",
+		CreatedAt:  time.Now(),
+		Session:    session,
 	}
 
 	s.tunnelsMu.Lock()
@@ -707,12 +741,21 @@ const dashboardTemplate = `
             --accent-color: #007bff;
             --status-active: #28a745;
         }
+        body.light-mode {
+            --bg-color: #f5f5f5;
+            --text-color: #333;
+            --header-color: #555;
+            --border-color: #ddd;
+            --table-header-bg: #e9ecef;
+            --table-row-odd-bg: #f8f9fa;
+        }
         body {
             font-family: 'Inter', sans-serif;
             background-color: var(--bg-color);
             color: var(--text-color);
             margin: 0;
             padding: 2rem;
+            transition: background-color 0.3s, color 0.3s;
         }
         .container {
             max-width: 1200px;
@@ -720,8 +763,13 @@ const dashboardTemplate = `
         }
         .header {
             display: flex;
+            justify-content: space-between;
             align-items: center;
             margin-bottom: 2rem;
+        }
+        .header-left {
+            display: flex;
+            align-items: center;
         }
         .logo {
             width: 40px;
@@ -732,6 +780,51 @@ const dashboardTemplate = `
             font-size: 2rem;
             font-weight: 600;
             color: var(--header-color);
+        }
+        .theme-switch-wrapper {
+            display: flex;
+            align-items: center;
+        }
+        .theme-switch {
+            display: inline-block;
+            height: 34px;
+            position: relative;
+            width: 60px;
+        }
+        .theme-switch input {
+            display:none;
+        }
+        .slider {
+            background-color: #ccc;
+            bottom: 0;
+            cursor: pointer;
+            left: 0;
+            position: absolute;
+            right: 0;
+            top: 0;
+            transition: .4s;
+        }
+        .slider:before {
+            background-color: #fff;
+            bottom: 4px;
+            content: "";
+            height: 26px;
+            left: 4px;
+            position: absolute;
+            transition: .4s;
+            width: 26px;
+        }
+        input:checked + .slider {
+            background-color: var(--accent-color);
+        }
+        input:checked + .slider:before {
+            transform: translateX(26px);
+        }
+        .slider.round {
+            border-radius: 34px;
+        }
+        .slider.round:before {
+            border-radius: 50%;
         }
         .summary {
             margin-bottom: 2rem;
@@ -770,9 +863,23 @@ const dashboardTemplate = `
         .url {
             word-break: break-all;
         }
+        .action-button {
+            background-color: #dc3545;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+        .action-button:hover {
+            background-color: #c82333;
+        }
         @media (max-width: 768px) {
             body { padding: 1rem; }
-            h1 { font-size: 1.5rem; }
+            .header { flex-direction: column; align-items: flex-start; }
+            .theme-switch-wrapper { margin-top: 1rem; }
+            h1 { font-size: 1.8rem; }
             table, thead, tbody, th, td, tr {
                 display: block;
             }
@@ -785,47 +892,67 @@ const dashboardTemplate = `
                 border: 1px solid var(--border-color);
                 margin-bottom: 1rem;
                 border-radius: 8px;
+                background-color: var(--table-row-odd-bg);
             }
             td {
                 border: none;
                 border-bottom: 1px solid var(--border-color);
                 position: relative;
                 padding-left: 50%;
+                padding-top: 0.75rem;
+                padding-bottom: 0.75rem;
+                display: flex;
+                align-items: center;
+            }
+            tr:last-child td:last-child {
+                border-bottom: none;
             }
             td:before {
                 position: absolute;
-                top: 0.5rem;
-                left: 0.5rem;
-                width: 45%;
-                padding-right: 0.5rem;
+                top: 50%;
+                transform: translateY(-50%);
+                left: 1rem;
+                width: 40%;
+                padding-right: 1rem;
                 white-space: nowrap;
                 font-weight: 600;
                 text-transform: uppercase;
-                font-size: 0.8rem;
+                font-size: 0.75rem;
                 color: var(--header-color);
             }
             td:nth-of-type(1):before { content: "ID"; }
             td:nth-of-type(2):before { content: "Tipo"; }
             td:nth-of-type(3):before { content: "URL Pubblico"; }
-            td:nth-of-type(4):before { content: "Stato"; }
-            td:nth-of-type(5):before { content: "Creato il"; }
-            td:nth-of-type(6):before { content: "Traffico (In / Out)"; }
+            td:nth-of-type(4):before { content: "Client"; }
+            td:nth-of-type(5):before { content: "Stato"; }
+            td:nth-of-type(6):before { content: "Creato il"; }
+            td:nth-of-type(7):before { content: "Durata"; }
+            td:nth-of-type(8):before { content: "Traffico (In / Out)"; }
+            td:nth-of-type(9):before { content: "Azione"; }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <svg class="logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                <defs>
-                    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                        <stop offset="0%" style="stop-color:var(--accent-color);stop-opacity:1" />
-                        <stop offset="100%" style="stop-color:var(--status-active);stop-opacity:1" />
-                    </linearGradient>
-                </defs>
-                <path d="M10 50 Q 20 20, 50 30 T 90 50 M10 50 Q 20 80, 50 70 T 90 50" fill="none" stroke="url(#logoGradient)" stroke-width="10" stroke-linecap="round"/>
-            </svg>
-            <h1>Sottopasso</h1>
+            <div class="header-left">
+                <svg class="logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+                    <defs>
+                        <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" style="stop-color:var(--accent-color);stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:var(--status-active);stop-opacity:1" />
+                        </linearGradient>
+                    </defs>
+                    <path d="M10 50 Q 20 20, 50 30 T 90 50 M10 50 Q 20 80, 50 70 T 90 50" fill="none" stroke="url(#logoGradient)" stroke-width="10" stroke-linecap="round"/>
+                </svg>
+                <h1>Sottopasso</h1>
+            </div>
+            <div class="theme-switch-wrapper">
+                <label class="theme-switch" for="checkbox">
+                    <input type="checkbox" id="checkbox" />
+                    <div class="slider round"></div>
+                </label>
+            </div>
         </div>
 
         <div class="summary">
@@ -838,9 +965,12 @@ const dashboardTemplate = `
                     <th>ID</th>
                     <th>Tipo</th>
                     <th>URL Pubblico</th>
+                    <th>Client</th>
                     <th>Stato</th>
                     <th>Creato il</th>
+                    <th>Durata</th>
                     <th>Traffico (In / Out)</th>
+                    <th>Azione</th>
                 </tr>
             </thead>
             <tbody>
@@ -849,14 +979,47 @@ const dashboardTemplate = `
                     <td>{{ .ID }}</td>
                     <td>{{ .Type }}</td>
                     <td class="url">{{ .PublicURL }}</td>
+                    <td>{{ .ClientAddr }}</td>
                     <td class="status-{{ .Status }}">{{ .Status }}</td>
                     <td>{{ .CreatedAt.Format "2006-01-02 15:04:05" }}</td>
+                    <td>{{ duration .CreatedAt }}</td>
                     <td>{{ formatBytes .TotalBytesIn.Load }} / {{ formatBytes .TotalBytesOut.Load }}</td>
+                    <td>
+                        <form method="POST" style="margin:0;">
+                            <input type="hidden" name="tunnelId" value="{{ .ID }}">
+                            <button type="submit" class="action-button">Chiudi</button>
+                        </form>
+                    </td>
                 </tr>
                 {{end}}
             </tbody>
         </table>
     </div>
+    <script>
+        const toggleSwitch = document.querySelector('.theme-switch input[type="checkbox"]');
+        const currentTheme = localStorage.getItem('theme');
+
+        if (currentTheme) {
+            document.body.classList.add(currentTheme);
+        
+            if (currentTheme === 'light-mode') {
+                toggleSwitch.checked = true;
+            }
+        }
+
+        function switchTheme(e) {
+            if (e.target.checked) {
+                document.body.classList.add('light-mode');
+                localStorage.setItem('theme', 'light-mode');
+            }
+            else {
+                document.body.classList.remove('light-mode');
+                localStorage.setItem('theme', 'dark-mode');
+            }
+        }
+
+        toggleSwitch.addEventListener('change', switchTheme, false);
+    </script>
 </body>
 </html>
 `
