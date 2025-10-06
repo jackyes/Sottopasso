@@ -1,7 +1,10 @@
 package server
 
 import (
+	"Sottopasso/pkg/metrics"
+	"Sottopasso/pkg/pool"
 	"Sottopasso/pkg/protocol"
+	customtls "Sottopasso/pkg/tls"
 	tunnel_pkg "Sottopasso/pkg/tunnel"
 	"bufio"
 	"crypto/rand"
@@ -10,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -31,14 +35,30 @@ import (
 
 // Tunnel rappresenta un singolo tunnel attivo gestito dal server.
 type Tunnel struct {
-	ID            string         `json:"id"`
-	Type          string         `json:"type"`
-	PublicURL     string         `json:"public_url"`
-	Status        string         `json:"status"`
-	CreatedAt     time.Time      `json:"created_at"`
-	TotalBytesIn  atomic.Uint64  `json:"total_bytes_in"`
-	TotalBytesOut atomic.Uint64  `json:"total_bytes_out"`
-	Session       *yamux.Session `json:"-"`
+	ID            string               `json:"id"`
+	Type          string               `json:"type"`
+	PublicURL     string               `json:"public_url"`
+	Status        string               `json:"status"`
+	CreatedAt     time.Time            `json:"created_at"`
+	TotalBytesIn  atomic.Uint64        `json:"total_bytes_in"`
+	TotalBytesOut atomic.Uint64        `json:"total_bytes_out"`
+	Session       *yamux.Session       `json:"-"`
+	Pool          *pool.ConnectionPool `json:"-"`
+
+	// Enhanced metrics
+	ActiveConnections atomic.Int32  `json:"active_connections"`
+	TotalConnections  atomic.Uint64 `json:"total_connections"`
+	FailedConnections atomic.Uint64 `json:"failed_connections"`
+	ConnectionErrors  atomic.Uint64 `json:"connection_errors"`
+	TimeoutErrors     atomic.Uint64 `json:"timeout_errors"`
+	ReadErrors        atomic.Uint64 `json:"read_errors"`
+	WriteErrors       atomic.Uint64 `json:"write_errors"`
+	TLSErrors         atomic.Uint64 `json:"tls_errors"`
+	LastActivity      time.Time     `json:"last_activity"`
+	AverageLatency    atomic.Uint64 `json:"average_latency"` // in microseconds
+	PeakLatency       atomic.Uint64 `json:"peak_latency"`    // in microseconds
+	RequestsPerSecond atomic.Uint64 `json:"requests_per_second"`
+	Uptime            time.Duration `json:"uptime"`
 }
 
 // Config contiene la configurazione per il server.
@@ -57,31 +77,77 @@ type Config struct {
 	DashboardTLSKeyFile    string
 	KeepaliveInterval      time.Duration
 	ConnectionWriteTimeout time.Duration
+
+	// TLS Session Resumption configuration
+	TLSConfig TLSConfig
+
+	// Metrics configuration
+	MetricsConfig MetricsConfig
+}
+
+// TLSConfig contiene la configurazione per l'ottimizzazione TLS.
+type TLSConfig struct {
+	EnableSessionResumption bool          `json:"enable_session_resumption"`
+	SessionCacheTTL         time.Duration `json:"session_cache_ttl"`
+	MaxCacheSize            int           `json:"max_cache_size"`
+	KeyRotationInterval     time.Duration `json:"key_rotation_interval"`
+}
+
+// MetricsConfig contiene la configurazione per la raccolta delle metriche.
+type MetricsConfig struct {
+	Enabled                   bool          `json:"enabled"`
+	CollectionInterval        time.Duration `json:"collection_interval"`
+	RetentionPeriod           time.Duration `json:"retention_period"`
+	EnableDetailedMetrics     bool          `json:"enable_detailed_metrics"`
+	EnableConnectionPoolStats bool          `json:"enable_connection_pool_stats"`
+	EnableBufferPoolStats     bool          `json:"enable_buffer_pool_stats"`
+	EnableSystemMetrics       bool          `json:"enable_system_metrics"`
+	EnableLatencyHistograms   bool          `json:"enable_latency_histograms"`
+	MaxHistogramBuckets       int           `json:"max_histogram_buckets"`
+	MetricsEndpoint           string        `json:"metrics_endpoint"`
 }
 
 // Server è la struttura principale del nostro tunnel server.
 type Server struct {
-	config          *Config
-	tunnels         map[string]*Tunnel
-	tunnelsMu       sync.RWMutex
-	httpTunnels     map[string]*Tunnel
-	httpTunnelsMu   sync.RWMutex
-	httpServer      *http.Server
-	dashboardServer *http.Server
-	controlListener net.Listener
+	config           *Config
+	tunnels          map[string]*Tunnel
+	tunnelsMu        sync.RWMutex
+	httpTunnels      map[string]*Tunnel
+	httpTunnelsMu    sync.RWMutex
+	httpServer       *http.Server
+	dashboardServer  *http.Server
+	controlListener  net.Listener
+	metricsCollector *metrics.MetricsCollector
 }
 
 // New crea una nuova istanza del server.
 func New(config *Config) *Server {
-	return &Server{
+	server := &Server{
 		config:      config,
 		tunnels:     make(map[string]*Tunnel),
 		httpTunnels: make(map[string]*Tunnel),
 	}
+
+	// Initialize metrics collector if enabled
+	if config.MetricsConfig.Enabled {
+		collectionInterval := config.MetricsConfig.CollectionInterval
+		if collectionInterval == 0 {
+			collectionInterval = 30 * time.Second // Default interval
+		}
+		server.metricsCollector = metrics.NewMetricsCollector(collectionInterval)
+	}
+
+	return server
 }
 
 // Start avvia tutti i listener del server.
 func (s *Server) Start() error {
+	// Start metrics collector if enabled
+	if s.metricsCollector != nil {
+		s.metricsCollector.Start()
+		log.Printf("Metrics collection started with interval: %v", s.config.MetricsConfig.CollectionInterval)
+	}
+
 	go s.startHTTPListener()
 	go s.startDashboardListener()
 	return s.startControlListener()
@@ -90,6 +156,13 @@ func (s *Server) Start() error {
 // Shutdown arresta il server in modo pulito.
 func (s *Server) Shutdown() {
 	log.Println("Arresto dei server...")
+
+	// Stop metrics collector if running
+	if s.metricsCollector != nil {
+		s.metricsCollector.Stop()
+		log.Println("Metrics collector stopped")
+	}
+
 	if s.controlListener != nil {
 		s.controlListener.Close()
 	}
@@ -208,6 +281,32 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 		tunnels = append(tunnels, t)
 	}
 
+	// Calculate aggregate metrics for the summary
+	var totalConnections, totalErrors, totalBytes uint64
+	var activeConnections int32
+	var totalLatency uint64
+	tunnelCount := len(tunnels)
+
+	for _, t := range tunnels {
+		totalConnections += t.TotalConnections.Load()
+		activeConnections += t.ActiveConnections.Load()
+		totalErrors += t.ConnectionErrors.Load() + t.ReadErrors.Load() + t.WriteErrors.Load() + t.TimeoutErrors.Load()
+		totalBytes += t.TotalBytesIn.Load() + t.TotalBytesOut.Load()
+		totalLatency += t.AverageLatency.Load()
+	}
+
+	avgLatency := uint64(0)
+	if tunnelCount > 0 {
+		avgLatency = totalLatency / uint64(tunnelCount)
+	}
+
+	errorRate := 0.0
+	if totalConnections > 0 {
+		errorRate = float64(totalErrors) / float64(totalConnections) * 100
+	}
+
+	hasErrors := totalErrors > 0
+
 	tmpl, err := template.New("dashboard").Funcs(template.FuncMap{
 		"formatBytes": func(b uint64) string {
 			const unit = 1024
@@ -219,8 +318,54 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 				return fmt.Sprintf("%.2f KB", kb)
 			}
 			mb := kb / unit
-			return fmt.Sprintf("%.2f MB", mb)
+			if mb < unit {
+				return fmt.Sprintf("%.2f MB", mb)
+			}
+			gb := mb / unit
+			return fmt.Sprintf("%.2f GB", gb)
 		},
+		"formatLatency": func(latency uint64) string {
+			if latency < 1000 {
+				return fmt.Sprintf("%d µs", latency)
+			} else if latency < 1000000 {
+				return fmt.Sprintf("%.1f ms", float64(latency)/1000)
+			}
+			return fmt.Sprintf("%.1f s", float64(latency)/1000000)
+		},
+		"add": func(nums ...uint64) uint64 {
+			var sum uint64
+			for _, n := range nums {
+				sum += n
+			}
+			return sum
+		},
+		"TotalConnections":  func() uint64 { return totalConnections },
+		"ActiveConnections": func() int32 { return activeConnections },
+		"TotalBytesFormatted": func() string {
+			const unit = 1024
+			if totalBytes < unit {
+				return fmt.Sprintf("%d B", totalBytes)
+			}
+			kb := float64(totalBytes) / unit
+			if kb < unit {
+				return fmt.Sprintf("%.1f KB", kb)
+			}
+			mb := kb / unit
+			if mb < unit {
+				return fmt.Sprintf("%.1f MB", mb)
+			}
+			gb := mb / unit
+			return fmt.Sprintf("%.1f GB", gb)
+		},
+		"AverageLatency": func() string {
+			if avgLatency < 1000 {
+				return fmt.Sprintf("%d µs", avgLatency)
+			}
+			return fmt.Sprintf("%.1f ms", float64(avgLatency)/1000)
+		},
+		"ErrorCount": func() uint64 { return totalErrors },
+		"ErrorRate":  func() string { return fmt.Sprintf("%.2f", errorRate) },
+		"HasErrors":  func() bool { return hasErrors },
 	}).Parse(dashboardTemplate)
 
 	if err != nil {
@@ -246,7 +391,19 @@ func (s *Server) getTLSConfig(certFile, keyFile, host string) (*tls.Config, erro
 	if err != nil {
 		return nil, fmt.Errorf("impossibile caricare la coppia di chiavi/certificati TLS: %w", err)
 	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+
+	// Create basic TLS config
+	baseConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	// Enhance with session resumption if enabled
+	if s.config.TLSConfig.EnableSessionResumption {
+		sessionManager := customtls.GetGlobalSessionManager()
+		return sessionManager.GetServerTLSConfig(baseConfig), nil
+	}
+
+	return baseConfig, nil
 }
 
 // generateSelfSignedCert crea un certificato e una chiave auto-firmati.
@@ -345,50 +502,64 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, t *Tunn
 		// Non possiamo inviare una risposta HTTP, la connessione è andata
 		return
 	}
-	defer clientConn.Close()
 
-	// Apri lo stream verso il client del tunnel
-	stream, err := t.Session.OpenStream()
+	// Use connection pool to get a stream
+	stream, err := t.Pool.GetStream()
 	if err != nil {
-		log.Printf("Impossibile aprire una stream per la richiesta WebSocket a %s: %v", host, err)
+		log.Printf("Impossibile ottenere una stream dal pool per la richiesta WebSocket a %s: %v", host, err)
+		clientConn.Close()
 		return
 	}
-	defer stream.Close()
+
+	// Update connection counters for WebSocket connection
+	t.ActiveConnections.Add(1)
+	t.TotalConnections.Add(1)
 
 	// Inoltra la richiesta di upgrade originale al client
 	// È importante che questa richiesta venga scritta prima di iniziare a leggere dalla connessione del client,
 	// altrimenti si potrebbe creare un deadlock.
 	if err := r.Write(stream); err != nil {
 		log.Printf("Errore durante la scrittura della richiesta di upgrade WebSocket sulla stream: %v", err)
+		clientConn.Close()
+		stream.Close()
+		t.ActiveConnections.Add(-1)
 		return
 	}
 
 	// A questo punto, la connessione HTTP è stata "promossa" a una connessione TCP bidirezionale.
 	// Dobbiamo fare da proxy tra la connessione del browser (clientConn) e la stream del tunnel.
 	// Questo gestirà la risposta 101 e il successivo traffico WebSocket.
-	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut)
-	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
+	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut, "websocket")
+	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn, "tunnel")
 
 	log.Printf("Avvio del proxy WebSocket per %s", host)
 	tunnel_pkg.Proxy(mClientConn, mStream)
 	log.Printf("Proxy WebSocket per %s terminato", host)
+
+	// Connection counters are decremented when connections are closed in Proxy
 }
 
 func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
-	stream, err := t.Session.OpenStream()
+	// Use connection pool to get a stream
+	stream, err := t.Pool.GetStream()
 	if err != nil {
-		log.Printf("Impossibile aprire una stream per l'host %s: %v", host, err)
+		log.Printf("Impossibile ottenere una stream dal pool per l'host %s: %v", host, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer stream.Close()
 
-	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
+	// Update connection counters for HTTP request
+	t.ActiveConnections.Add(1)
+	t.TotalConnections.Add(1)
+
+	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn, "http")
 
 	// Scrivi la richiesta HTTP nella stream del tunnel
 	if err := r.Write(mStream); err != nil {
 		log.Printf("Errore durante la scrittura della richiesta sulla stream: %v", err)
+		stream.Close()
+		t.ActiveConnections.Add(-1)
 		return
 	}
 
@@ -400,6 +571,8 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
 			log.Printf("Errore durante la lettura della risposta dalla stream: %v", err)
 		}
+		stream.Close()
+		t.ActiveConnections.Add(-1)
 		// Non possiamo inviare un header qui perché la connessione potrebbe essere in uno stato indeterminato.
 		// Proviamo a inviare un BadGateway, ma potrebbe fallire.
 		// w.WriteHeader(http.StatusBadGateway)
@@ -417,6 +590,10 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	// Scrivi lo status code e il corpo della risposta
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+
+	// Close stream after response is fully written
+	stream.Close()
+	t.ActiveConnections.Add(-1)
 }
 
 // handleClientConnection gestisce il ciclo di vita di un singolo client connesso.
@@ -506,6 +683,8 @@ func (s *Server) handleRequestTunnel(msg *protocol.ControlMessage, session *yamu
 		return s.setupTCPTunnel(req, session, ctrlStream)
 	case "http":
 		return s.setupHTTPTunnel(req, session, ctrlStream)
+	case "udp":
+		return s.setupUDPTunnel(req, session, ctrlStream)
 	default:
 		return fmt.Errorf("unsupported tunnel type: %s", req.Type)
 	}
@@ -545,13 +724,22 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	}
 
 	tunnel := &Tunnel{
-		ID:        uuid.New().String(),
-		Type:      "http",
-		PublicURL: fmt.Sprintf("%s://%s", schema, host),
-		Status:    "active",
-		CreatedAt: time.Now(),
-		Session:   session,
+		ID:           uuid.New().String(),
+		Type:         "http",
+		PublicURL:    fmt.Sprintf("%s://%s", schema, host),
+		Status:       "active",
+		CreatedAt:    time.Now(),
+		Session:      session,
+		LastActivity: time.Now(),
 	}
+
+	// Initialize connection pool for HTTP tunnel
+	poolConfig := pool.PoolConfig{
+		MaxSize:     100,
+		IdleTimeout: 30 * time.Second,
+		MaxIdle:     20,
+	}
+	tunnel.Pool = pool.NewConnectionPool(session, poolConfig)
 
 	s.tunnelsMu.Lock()
 	s.tunnels[tunnel.ID] = tunnel
@@ -578,19 +766,111 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 
 	publicAddr := listener.Addr().String()
 	tunnel := &Tunnel{
-		ID:        uuid.New().String(),
-		Type:      "tcp",
-		PublicURL: publicAddr,
-		Status:    "active",
-		CreatedAt: time.Now(),
-		Session:   session,
+		ID:           uuid.New().String(),
+		Type:         "tcp",
+		PublicURL:    publicAddr,
+		Status:       "active",
+		CreatedAt:    time.Now(),
+		Session:      session,
+		LastActivity: time.Now(),
 	}
+
+	// Initialize connection pool for TCP tunnel
+	poolConfig := pool.PoolConfig{
+		MaxSize:     100,
+		IdleTimeout: 30 * time.Second,
+		MaxIdle:     20,
+	}
+	tunnel.Pool = pool.NewConnectionPool(session, poolConfig)
 
 	s.tunnelsMu.Lock()
 	s.tunnels[tunnel.ID] = tunnel
 	s.tunnelsMu.Unlock()
 
 	log.Printf("TCP tunnel created: %s -> %s", tunnel.PublicURL, tunnel.ID)
+
+	resp := protocol.TunnelResponse{PublicURL: publicAddr}
+	payload, _ := json.Marshal(resp)
+	respMsg := protocol.ControlMessage{
+		Type:       protocol.TunnelResponseType,
+		RawPayload: payload,
+	}
+	if err := json.NewEncoder(ctrlStream).Encode(respMsg); err != nil {
+		listener.Close()
+		tunnel.Pool.Close()
+		return fmt.Errorf("error sending TunnelResponse: %w", err)
+	}
+
+	go func() {
+		defer listener.Close()
+		defer tunnel.Pool.Close()
+		go func() {
+			<-session.CloseChan()
+			listener.Close()
+		}()
+
+		for {
+			publicConn, err := listener.Accept()
+			if err != nil {
+				log.Printf("TCP listener for %s terminated.", publicAddr)
+				return
+			}
+
+			go func(publicConn net.Conn) {
+				defer publicConn.Close()
+				log.Printf("Accepted public connection from %s, forwarding to client %s", publicConn.RemoteAddr(), session.RemoteAddr())
+
+				// Update connection counters for TCP connection
+				tunnel.ActiveConnections.Add(1)
+				tunnel.TotalConnections.Add(1)
+
+				// Use connection pool to get a stream
+				stream, err := tunnel.Pool.GetStream()
+				if err != nil {
+					log.Printf("Unable to get stream from pool for client %s: %v", session.RemoteAddr(), err)
+					tunnel.ActiveConnections.Add(-1)
+					return
+				}
+
+				mPublicConn := tunnel_pkg.NewMeasuredConn(publicConn, &tunnel.TotalBytesIn, &tunnel.TotalBytesOut, "tcp")
+				mStream := tunnel_pkg.NewMeasuredConn(stream, &tunnel.TotalBytesOut, &tunnel.TotalBytesIn, "tunnel")
+
+				tunnel_pkg.Proxy(mPublicConn, mStream)
+				// Connection counters are decremented when connections are closed in Proxy
+			}(publicConn)
+		}
+	}()
+	return nil
+}
+
+// setupUDPTunnel creates a UDP tunnel that forwards UDP packets between public clients and the tunnel client.
+func (s *Server) setupUDPTunnel(req protocol.RequestTunnel, session *yamux.Session, ctrlStream net.Conn) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
+	if err != nil {
+		return fmt.Errorf("unable to resolve UDP address: %w", err)
+	}
+
+	listener, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return fmt.Errorf("unable to start UDP listener: %w", err)
+	}
+
+	publicAddr := listener.LocalAddr().String()
+	tunnel := &Tunnel{
+		ID:           uuid.New().String(),
+		Type:         "udp",
+		PublicURL:    publicAddr,
+		Status:       "active",
+		CreatedAt:    time.Now(),
+		Session:      session,
+		LastActivity: time.Now(),
+	}
+
+	s.tunnelsMu.Lock()
+	s.tunnels[tunnel.ID] = tunnel
+	s.tunnelsMu.Unlock()
+
+	log.Printf("UDP tunnel created: %s -> %s", tunnel.PublicURL, tunnel.ID)
 
 	resp := protocol.TunnelResponse{PublicURL: publicAddr}
 	payload, _ := json.Marshal(resp)
@@ -610,29 +890,85 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 			listener.Close()
 		}()
 
+		// Get buffer pool instance
+		bufferPool := pool.GetGlobalBufferPool()
+
 		for {
-			publicConn, err := listener.Accept()
+			// Use pooled buffer instead of fixed allocation
+			buffer := bufferPool.GetLarge()
+			n, clientAddr, err := listener.ReadFromUDP(buffer)
 			if err != nil {
-				log.Printf("TCP listener for %s terminated.", publicAddr)
-				return
+				bufferPool.PutLarge(buffer)
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					log.Printf("UDP listener for %s terminated.", publicAddr)
+					return
+				}
+				log.Printf("Error reading from UDP: %v", err)
+				continue
 			}
 
-			go func(publicConn net.Conn) {
-				defer publicConn.Close()
-				log.Printf("Accepted public connection from %s, forwarding to client %s", publicConn.RemoteAddr(), session.RemoteAddr())
+			go func(data []byte, clientAddr *net.UDPAddr) {
+				defer bufferPool.PutLarge(buffer)
+				log.Printf("Received UDP packet from %s, forwarding to client %s", clientAddr, session.RemoteAddr())
+
+				// Update connection counters for UDP connection
+				tunnel.ActiveConnections.Add(1)
+				tunnel.TotalConnections.Add(1)
 
 				stream, err := session.OpenStream()
 				if err != nil {
 					log.Printf("Unable to open new stream for client %s: %v", session.RemoteAddr(), err)
+					tunnel.ActiveConnections.Add(-1)
 					return
 				}
-				defer stream.Close()
 
-				mPublicConn := tunnel_pkg.NewMeasuredConn(publicConn, &tunnel.TotalBytesIn, &tunnel.TotalBytesOut)
-				mStream := tunnel_pkg.NewMeasuredConn(stream, &tunnel.TotalBytesOut, &tunnel.TotalBytesIn)
+				// Send client address info first
+				addrData := []byte(clientAddr.String())
+				addrLen := bufferPool.GetSmall()[:4]
+				defer bufferPool.PutSmall(addrLen)
+				binary.BigEndian.PutUint32(addrLen, uint32(len(addrData)))
 
-				tunnel_pkg.Proxy(mPublicConn, mStream)
-			}(publicConn)
+				// Send address length, then address, then data
+				if _, err := stream.Write(addrLen); err != nil {
+					log.Printf("Error writing address length: %v", err)
+					stream.Close()
+					tunnel.ActiveConnections.Add(-1)
+					return
+				}
+				if _, err := stream.Write(addrData); err != nil {
+					log.Printf("Error writing address: %v", err)
+					stream.Close()
+					tunnel.ActiveConnections.Add(-1)
+					return
+				}
+				if _, err := stream.Write(data); err != nil {
+					log.Printf("Error writing data: %v", err)
+					stream.Close()
+					tunnel.ActiveConnections.Add(-1)
+					return
+				}
+
+				// Read response from client using pooled buffer
+				responseBuffer := bufferPool.GetLarge()
+				defer bufferPool.PutLarge(responseBuffer)
+				n, err := stream.Read(responseBuffer)
+				if err != nil && err != io.EOF {
+					log.Printf("Error reading response from client: %v", err)
+					stream.Close()
+					tunnel.ActiveConnections.Add(-1)
+					return
+				}
+
+				if n > 0 {
+					// Send response back to original client
+					if _, err := listener.WriteToUDP(responseBuffer[:n], clientAddr); err != nil {
+						log.Printf("Error sending UDP response to %s: %v", clientAddr, err)
+					}
+				}
+
+				stream.Close()
+				tunnel.ActiveConnections.Add(-1)
+			}(append([]byte(nil), buffer[:n]...), clientAddr)
 		}
 	}()
 	return nil
@@ -691,7 +1027,7 @@ const dashboardTemplate = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sottopasso - Dashboard</title>
+    <title>Sottopasso - Performance Dashboard</title>
     <meta http-equiv="refresh" content="5">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -706,6 +1042,8 @@ const dashboardTemplate = `
             --table-row-odd-bg: #252525;
             --accent-color: #007bff;
             --status-active: #28a745;
+            --warning-color: #ffc107;
+            --error-color: #dc3545;
         }
         body {
             font-family: 'Inter', sans-serif;
@@ -715,7 +1053,7 @@ const dashboardTemplate = `
             padding: 2rem;
         }
         .container {
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
         }
         .header {
@@ -741,6 +1079,34 @@ const dashboardTemplate = `
             font-weight: 600;
             color: var(--accent-color);
         }
+        .summary .warning {
+            color: var(--warning-color);
+        }
+        .summary .error {
+            color: var(--error-color);
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .stat-card {
+            background-color: var(--table-header-bg);
+            padding: 1rem;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--accent-color);
+        }
+        .stat-label {
+            font-size: 0.8rem;
+            color: var(--header-color);
+            text-transform: uppercase;
+        }
         table {
             border-collapse: collapse;
             width: 100%;
@@ -749,9 +1115,10 @@ const dashboardTemplate = `
             overflow: hidden;
         }
         th, td {
-            padding: 1rem;
+            padding: 0.75rem;
             text-align: left;
             border-bottom: 1px solid var(--border-color);
+            font-size: 0.9rem;
         }
         th {
             background-color: var(--table-header-bg);
@@ -770,9 +1137,21 @@ const dashboardTemplate = `
         .url {
             word-break: break-all;
         }
+        .metric-good {
+            color: var(--status-active);
+        }
+        .metric-warning {
+            color: var(--warning-color);
+        }
+        .metric-error {
+            color: var(--error-color);
+        }
         @media (max-width: 768px) {
             body { padding: 1rem; }
             h1 { font-size: 1.5rem; }
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
             table, thead, tbody, th, td, tr {
                 display: block;
             }
@@ -809,7 +1188,10 @@ const dashboardTemplate = `
             td:nth-of-type(3):before { content: "URL Pubblico"; }
             td:nth-of-type(4):before { content: "Stato"; }
             td:nth-of-type(5):before { content: "Creato il"; }
-            td:nth-of-type(6):before { content: "Traffico (In / Out)"; }
+            td:nth-of-type(6):before { content: "Connessioni Attive"; }
+            td:nth-of-type(7):before { content: "Traffico (In / Out)"; }
+            td:nth-of-type(8):before { content: "Errori"; }
+            td:nth-of-type(9):before { content: "Latenza"; }
         }
     </style>
 </head>
@@ -825,11 +1207,33 @@ const dashboardTemplate = `
                 </defs>
                 <path d="M10 50 Q 20 20, 50 30 T 90 50 M10 50 Q 20 80, 50 70 T 90 50" fill="none" stroke="url(#logoGradient)" stroke-width="10" stroke-linecap="round"/>
             </svg>
-            <h1>Sottopasso</h1>
+            <h1>Sottopasso - Performance Dashboard</h1>
         </div>
 
         <div class="summary">
-            <p>Tunnel attivi: <span>{{ len . }}</span></p>
+            <p>Tunnel attivi: <span>{{ len . }}</span> |
+               Connessioni totali: <span>{{ TotalConnections }}</span> |
+               Errori: <span class="{{ if HasErrors }}error{{ else }}warning{{ end }}">{{ ErrorRate }}%</span>
+            </p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">{{ ActiveConnections }}</div>
+                <div class="stat-label">Connessioni Attive</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{{ TotalBytesFormatted }}</div>
+                <div class="stat-label">Traffico Totale</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{{ AverageLatency }}</div>
+                <div class="stat-label">Latenza Media</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{{ ErrorCount }}</div>
+                <div class="stat-label">Errori Totali</div>
+            </div>
         </div>
 
         <table>
@@ -840,7 +1244,10 @@ const dashboardTemplate = `
                     <th>URL Pubblico</th>
                     <th>Stato</th>
                     <th>Creato il</th>
+                    <th>Connessioni Attive</th>
                     <th>Traffico (In / Out)</th>
+                    <th>Errori</th>
+                    <th>Latenza</th>
                 </tr>
             </thead>
             <tbody>
@@ -851,7 +1258,14 @@ const dashboardTemplate = `
                     <td class="url">{{ .PublicURL }}</td>
                     <td class="status-{{ .Status }}">{{ .Status }}</td>
                     <td>{{ .CreatedAt.Format "2006-01-02 15:04:05" }}</td>
+                    <td>{{ .ActiveConnections.Load }}</td>
                     <td>{{ formatBytes .TotalBytesIn.Load }} / {{ formatBytes .TotalBytesOut.Load }}</td>
+                    <td class="{{ if gt (add .ConnectionErrors.Load .ReadErrors.Load .WriteErrors.Load .TimeoutErrors.Load) 0 }}metric-error{{ end }}">
+                        {{ add .ConnectionErrors.Load .ReadErrors.Load .WriteErrors.Load .TimeoutErrors.Load }}
+                    </td>
+                    <td class="{{ if gt .AverageLatency.Load 100000 }}metric-warning{{ else }}metric-good{{ end }}">
+                        {{ formatLatency .AverageLatency.Load }}
+                    </td>
                 </tr>
                 {{end}}
             </tbody>

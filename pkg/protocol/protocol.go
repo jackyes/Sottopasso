@@ -38,7 +38,7 @@ type AuthResponse struct {
 
 // RequestTunnel is the message sent by the client to request a new tunnel.
 type RequestTunnel struct {
-	Type      string `json:"type"` // "http" o "tcp"
+	Type      string `json:"type"` // "http", "tcp" o "udp"
 	LocalPort int    `json:"local_port"`
 	Subdomain string `json:"subdomain,omitempty"` // Request for a specific subdomain (optional)
 }
