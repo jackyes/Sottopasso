@@ -62,22 +62,60 @@ type Config struct {
 
 // Server è la struttura principale del nostro tunnel server.
 type Server struct {
-	config          *Config
-	tunnels         map[string]*Tunnel
-	tunnelsMu       sync.RWMutex
-	httpTunnels     map[string]*Tunnel
-	httpTunnelsMu   sync.RWMutex
-	httpServer      *http.Server
-	dashboardServer *http.Server
-	controlListener net.Listener
+	config            *Config
+	tunnels           map[string]*Tunnel
+	tunnelsMu         sync.RWMutex
+	httpTunnels       map[string]*Tunnel
+	httpTunnelsMu     sync.RWMutex
+	httpServer        *http.Server
+	dashboardServer   *http.Server
+	controlListener   net.Listener
+	dashboardTemplate *template.Template
+	csrfToken         string
 }
 
 // New crea una nuova istanza del server.
 func New(config *Config) *Server {
+	// Generate a random CSRF token for dashboard form protection
+	csrfBytes := make([]byte, 32)
+	rand.Read(csrfBytes)
+	csrfToken := fmt.Sprintf("%x", csrfBytes)
+
+	tmpl := template.Must(template.New("dashboard").Funcs(template.FuncMap{
+		"formatBytes": func(b uint64) string {
+			const unit = 1024
+			if b < unit {
+				return fmt.Sprintf("%d B", b)
+			}
+			kb := float64(b) / unit
+			if kb < unit {
+				return fmt.Sprintf("%.2f KB", kb)
+			}
+			mb := kb / unit
+			if mb < unit {
+				return fmt.Sprintf("%.2f MB", mb)
+			}
+			gb := mb / unit
+			if gb < unit {
+				return fmt.Sprintf("%.2f GB", gb)
+			}
+			tb := gb / unit
+			return fmt.Sprintf("%.2f TB", tb)
+		},
+		"duration": func(d time.Time) string {
+			return time.Since(d).Round(time.Second).String()
+		},
+		"csrfToken": func() string {
+			return csrfToken
+		},
+	}).Parse(dashboardTemplate))
+
 	return &Server{
-		config:      config,
-		tunnels:     make(map[string]*Tunnel),
-		httpTunnels: make(map[string]*Tunnel),
+		config:            config,
+		tunnels:           make(map[string]*Tunnel),
+		httpTunnels:       make(map[string]*Tunnel),
+		dashboardTemplate: tmpl,
+		csrfToken:         csrfToken,
 	}
 }
 
@@ -138,14 +176,21 @@ func (s *Server) startDashboardListener() {
 	}
 
 	handler := http.HandlerFunc(s.serveDashboard)
-	authHandler := s.basicAuth(handler)
-	s.dashboardServer = &http.Server{Addr: s.config.DashboardAddr, Handler: authHandler}
+	authHandler := s.securityHeaders(s.basicAuth(handler))
+	s.dashboardServer = &http.Server{
+		Addr:         s.config.DashboardAddr,
+		Handler:      authHandler,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
 
 	useTLS := s.config.DashboardTLSCertFile != "" && s.config.DashboardTLSKeyFile != ""
 	if useTLS {
 		log.Printf("Dashboard di stato sicura disponibile su https://%s", s.config.DashboardAddr)
 		if _, err := s.getTLSConfig(s.config.DashboardTLSCertFile, s.config.DashboardTLSKeyFile, "localhost"); err != nil {
-			log.Fatalf("Impossibile ottenere la configurazione TLS per la dashboard: %v", err)
+			log.Printf("Impossibile ottenere la configurazione TLS per la dashboard: %v", err)
+			return
 		}
 		if err := s.dashboardServer.ListenAndServeTLS(s.config.DashboardTLSCertFile, s.config.DashboardTLSKeyFile); err != http.ErrServerClosed {
 			log.Printf("Errore del server dashboard TLS: %v", err)
@@ -169,12 +214,12 @@ func (s *Server) startHTTPListener() {
 	if s.config.HTTPUseTLS {
 		log.Printf("Il listener HTTPS è in ascolto su %s", s.config.HTTPAddr)
 		if err := s.httpServer.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile); err != http.ErrServerClosed {
-			log.Fatalf("Errore fatale del listener HTTPS: %v", err)
+			log.Printf("Errore fatale del listener HTTPS: %v", err)
 		}
 	} else {
 		log.Printf("Il listener HTTP è in ascolto su %s", s.config.HTTPAddr)
 		if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatalf("Errore fatale del listener HTTP: %v", err)
+			log.Printf("Errore fatale del listener HTTP: %v", err)
 		}
 	}
 }
@@ -199,6 +244,16 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 	})
 }
 
+// securityHeaders aggiunge header di sicurezza alle risposte HTTP.
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // serveDashboard è l'handler per la pagina di stato.
 func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
@@ -214,36 +269,20 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 		tunnels = append(tunnels, t)
 	}
 
-	tmpl, err := template.New("dashboard").Funcs(template.FuncMap{
-		"formatBytes": func(b uint64) string {
-			const unit = 1024
-			if b < unit {
-				return fmt.Sprintf("%d B", b)
-			}
-			kb := float64(b) / unit
-			if kb < unit {
-				return fmt.Sprintf("%.2f KB", kb)
-			}
-			mb := kb / unit
-			return fmt.Sprintf("%.2f MB", mb)
-		},
-		"duration": func(d time.Time) string {
-			return time.Since(d).Round(time.Second).String()
-		},
-	}).Parse(dashboardTemplate)
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Errore del template: %v", err)
-		return
-	}
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	tmpl.Execute(w, tunnels)
+	if err := s.dashboardTemplate.Execute(w, tunnels); err != nil {
+		log.Printf("Errore durante l'esecuzione del template dashboard: %v", err)
+	}
 }
 
 // handleCloseTunnel gestisce la richiesta di chiusura di un tunnel.
 func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
+	token := r.FormValue("csrf_token")
+	if subtle.ConstantTimeCompare([]byte(token), []byte(s.csrfToken)) != 1 {
+		http.Error(w, "Token CSRF non valido", http.StatusForbidden)
+		return
+	}
+
 	tunnelID := r.FormValue("tunnelId")
 	if tunnelID == "" {
 		http.Error(w, "ID tunnel non fornito", http.StatusBadRequest)
@@ -262,7 +301,7 @@ func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Chiusura del tunnel %s su richiesta dalla dashboard", tunnelID)
 	tunnel.Session.Close()
 
-	http.Redirect(w, r, r.Header.Get("Referer"), http.StatusFound)
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 // getTLSConfig carica o genera una configurazione TLS.
@@ -335,6 +374,10 @@ func generateSelfSignedCert(certFile, keyFile, host string) error {
 // ServeHTTP implementa l'interfaccia http.Handler per il reverse proxy.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
+	// Strip port from Host header so lookup matches the stored key (subdomain.domain)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
 	s.httpTunnelsMu.RLock()
 	t, ok := s.httpTunnels[host]
 	s.httpTunnelsMu.RUnlock()
@@ -507,10 +550,11 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 
 // cleanupTunnelsForSession removes all tunnels associated with a client session.
 func (s *Server) cleanupTunnelsForSession(session *yamux.Session) {
-	s.tunnelsMu.Lock()
-	defer s.tunnelsMu.Unlock()
+	// Lock order: httpTunnelsMu -> tunnelsMu (same as setupHTTPTunnel to avoid deadlock)
 	s.httpTunnelsMu.Lock()
 	defer s.httpTunnelsMu.Unlock()
+	s.tunnelsMu.Lock()
+	defer s.tunnelsMu.Unlock()
 
 	for id, t := range s.tunnels {
 		if t.Session == session {
@@ -539,7 +583,15 @@ func (s *Server) handleRequestTunnel(msg *protocol.ControlMessage, session *yamu
 	case "http":
 		return s.setupHTTPTunnel(req, session, ctrlStream)
 	default:
-		return fmt.Errorf("unsupported tunnel type: %s", req.Type)
+		errMsg := fmt.Sprintf("unsupported tunnel type: %s", req.Type)
+		resp := protocol.TunnelResponse{Error: errMsg}
+		payload, _ := json.Marshal(resp)
+		respMsg := protocol.ControlMessage{
+			Type:       protocol.TunnelResponseType,
+			RawPayload: payload,
+		}
+		json.NewEncoder(ctrlStream).Encode(respMsg)
+		return fmt.Errorf("%s", errMsg)
 	}
 }
 
@@ -674,6 +726,10 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 
 // authenticate handles the authentication flow.
 func (s *Server) authenticate(conn net.Conn) bool {
+	// Set a deadline to prevent clients from holding connections open without authenticating
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer conn.SetReadDeadline(time.Time{}) // Clear deadline after auth
+
 	var msg protocol.ControlMessage
 	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
 		log.Printf("Error decoding auth message: %v", err)
@@ -693,7 +749,7 @@ func (s *Server) authenticate(conn net.Conn) bool {
 
 	valid := false
 	for _, token := range s.config.ValidTokens {
-		if token == authReq.AuthToken {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(authReq.AuthToken)) == 1 {
 			valid = true
 			break
 		}
@@ -986,6 +1042,7 @@ const dashboardTemplate = `
                     <td>{{ formatBytes .TotalBytesIn.Load }} / {{ formatBytes .TotalBytesOut.Load }}</td>
                     <td>
                         <form method="POST" style="margin:0;">
+                            <input type="hidden" name="csrf_token" value="{{ csrfToken }}">
                             <input type="hidden" name="tunnelId" value="{{ .ID }}">
                             <button type="submit" class="action-button">Chiudi</button>
                         </form>

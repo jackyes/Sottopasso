@@ -3,7 +3,6 @@ package main
 import (
 	"Sottopasso/pkg/client"
 	"flag"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
@@ -73,7 +72,7 @@ func main() {
 		KeepaliveInterval:      "30s",  // Default value
 		ConnectionWriteTimeout: "10s",  // Default value
 	}
-	yamlFile, err := ioutil.ReadFile(*configPath)
+	yamlFile, err := os.ReadFile(*configPath)
 	if err == nil {
 		yaml.Unmarshal(yamlFile, &configYAML)
 	}

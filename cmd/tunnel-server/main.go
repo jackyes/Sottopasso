@@ -3,7 +3,6 @@ package main
 import (
 	"Sottopasso/pkg/server"
 	"flag"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
@@ -37,7 +36,7 @@ func main() {
 	connectionWriteTimeout := flag.String("connection-write-timeout", "", "Connection write timeout (e.g., 10s, 1m). Overrides config.")
 	flag.Parse()
 
-	yamlFile, err := ioutil.ReadFile(*configPath)
+	yamlFile, err := os.ReadFile(*configPath)
 	if err != nil {
 		log.Fatalf("Error reading configuration file %s: %v", *configPath, err)
 	}
