@@ -29,7 +29,7 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
-// Tunnel rappresenta un singolo tunnel attivo gestito dal server.
+// Tunnel represents a single active tunnel managed by the server.
 type Tunnel struct {
 	ID            string         `json:"id"`
 	Type          string         `json:"type"`
@@ -42,7 +42,7 @@ type Tunnel struct {
 	Session       *yamux.Session `json:"-"`
 }
 
-// Config contiene la configurazione per il server.
+// Config contains the server configuration.
 type Config struct {
 	ControlAddr            string
 	HTTPAddr               string
@@ -60,7 +60,7 @@ type Config struct {
 	ConnectionWriteTimeout time.Duration
 }
 
-// Server è la struttura principale del nostro tunnel server.
+// Server is the main structure of our tunnel server.
 type Server struct {
 	config            *Config
 	tunnels           map[string]*Tunnel
@@ -74,7 +74,7 @@ type Server struct {
 	csrfToken         string
 }
 
-// New crea una nuova istanza del server.
+// New creates a new server instance.
 func New(config *Config) *Server {
 	// Generate a random CSRF token for dashboard form protection
 	csrfBytes := make([]byte, 32)
@@ -119,16 +119,16 @@ func New(config *Config) *Server {
 	}
 }
 
-// Start avvia tutti i listener del server.
+// Start starts all the server listeners.
 func (s *Server) Start() error {
 	go s.startHTTPListener()
 	go s.startDashboardListener()
 	return s.startControlListener()
 }
 
-// Shutdown arresta il server in modo pulito.
+// Shutdown gracefully stops the server.
 func (s *Server) Shutdown() {
-	log.Println("Arresto dei server...")
+	log.Println("Shutting down servers...")
 	if s.controlListener != nil {
 		s.controlListener.Close()
 	}
@@ -140,17 +140,17 @@ func (s *Server) Shutdown() {
 	}
 }
 
-// startControlListener avvia il listener per i client.
+// startControlListener starts the listener for client connections.
 func (s *Server) startControlListener() error {
 	lsConfig, err := s.getTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile, "localhost")
 	if err != nil {
-		return fmt.Errorf("impossibile ottenere la configurazione TLS di controllo: %w", err)
+		return fmt.Errorf("unable to get control TLS configuration: %w", err)
 	}
 
-	log.Printf("Il server di controllo TLS è in ascolto su %s", s.config.ControlAddr)
+	log.Printf("TLS control server listening on %s", s.config.ControlAddr)
 	ln, err := tls.Listen("tcp", s.config.ControlAddr, lsConfig)
 	if err != nil {
-		return fmt.Errorf("impossibile avviare il listener di controllo TLS: %w", err)
+		return fmt.Errorf("unable to start control TLS listener: %w", err)
 	}
 	s.controlListener = ln
 	defer s.controlListener.Close()
@@ -161,7 +161,7 @@ func (s *Server) startControlListener() error {
 			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
 				break
 			}
-			log.Printf("Errore durante l'accettazione di una nuova connessione TLS: %v", err)
+			log.Printf("Error accepting new TLS connection: %v", err)
 			continue
 		}
 		go s.handleClientConnection(conn)
@@ -169,7 +169,7 @@ func (s *Server) startControlListener() error {
 	return nil
 }
 
-// startDashboardListener avvia il server web per la pagina di stato.
+// startDashboardListener starts the web server for the status page.
 func (s *Server) startDashboardListener() {
 	if s.config.DashboardAddr == "" {
 		return
@@ -187,23 +187,23 @@ func (s *Server) startDashboardListener() {
 
 	useTLS := s.config.DashboardTLSCertFile != "" && s.config.DashboardTLSKeyFile != ""
 	if useTLS {
-		log.Printf("Dashboard di stato sicura disponibile su https://%s", s.config.DashboardAddr)
+		log.Printf("Secure status dashboard available at https://%s", s.config.DashboardAddr)
 		if _, err := s.getTLSConfig(s.config.DashboardTLSCertFile, s.config.DashboardTLSKeyFile, "localhost"); err != nil {
-			log.Printf("Impossibile ottenere la configurazione TLS per la dashboard: %v", err)
+			log.Printf("Unable to get TLS configuration for dashboard: %v", err)
 			return
 		}
 		if err := s.dashboardServer.ListenAndServeTLS(s.config.DashboardTLSCertFile, s.config.DashboardTLSKeyFile); err != http.ErrServerClosed {
-			log.Printf("Errore del server dashboard TLS: %v", err)
+			log.Printf("Dashboard TLS server error: %v", err)
 		}
 	} else {
-		log.Printf("Dashboard di stato disponibile su http://%s", s.config.DashboardAddr)
+		log.Printf("Status dashboard available at http://%s", s.config.DashboardAddr)
 		if err := s.dashboardServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("Errore del server dashboard: %v", err)
+			log.Printf("Dashboard server error: %v", err)
 		}
 	}
 }
 
-// startHTTPListener avvia il reverse proxy pubblico.
+// startHTTPListener starts the public reverse proxy.
 func (s *Server) startHTTPListener() {
 	if s.config.HTTPAddr == "" {
 		return
@@ -212,19 +212,19 @@ func (s *Server) startHTTPListener() {
 	s.httpServer = &http.Server{Addr: s.config.HTTPAddr, Handler: s}
 
 	if s.config.HTTPUseTLS {
-		log.Printf("Il listener HTTPS è in ascolto su %s", s.config.HTTPAddr)
+		log.Printf("HTTPS listener listening on %s", s.config.HTTPAddr)
 		if err := s.httpServer.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile); err != http.ErrServerClosed {
-			log.Printf("Errore fatale del listener HTTPS: %v", err)
+			log.Printf("Fatal HTTPS listener error: %v", err)
 		}
 	} else {
-		log.Printf("Il listener HTTP è in ascolto su %s", s.config.HTTPAddr)
+		log.Printf("HTTP listener listening on %s", s.config.HTTPAddr)
 		if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("Errore fatale del listener HTTP: %v", err)
+			log.Printf("Fatal HTTP listener error: %v", err)
 		}
 	}
 }
 
-// basicAuth è un middleware per l'autenticazione HTTP Basic.
+// basicAuth is an HTTP Basic authentication middleware.
 func (s *Server) basicAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.config.DashboardUsername == "" || s.config.DashboardPassword == "" {
@@ -235,16 +235,16 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 		userMatch := subtle.ConstantTimeCompare([]byte(user), []byte(s.config.DashboardUsername)) == 1
 		passMatch := subtle.ConstantTimeCompare([]byte(pass), []byte(s.config.DashboardPassword)) == 1
 		if !ok || !userMatch || !passMatch {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Accesso ristretto"`)
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted Access"`)
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Autenticazione richiesta.\n"))
+			w.Write([]byte("Authentication required.\n"))
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// securityHeaders aggiunge header di sicurezza alle risposte HTTP.
+// securityHeaders adds security headers to HTTP responses.
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Frame-Options", "DENY")
@@ -254,7 +254,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// serveDashboard è l'handler per la pagina di stato.
+// serveDashboard is the handler for the status page.
 func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		s.handleCloseTunnel(w, r)
@@ -271,21 +271,21 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.dashboardTemplate.Execute(w, tunnels); err != nil {
-		log.Printf("Errore durante l'esecuzione del template dashboard: %v", err)
+		log.Printf("Error executing dashboard template: %v", err)
 	}
 }
 
-// handleCloseTunnel gestisce la richiesta di chiusura di un tunnel.
+// handleCloseTunnel handles tunnel close requests.
 func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	token := r.FormValue("csrf_token")
 	if subtle.ConstantTimeCompare([]byte(token), []byte(s.csrfToken)) != 1 {
-		http.Error(w, "Token CSRF non valido", http.StatusForbidden)
+		http.Error(w, "Invalid CSRF token", http.StatusForbidden)
 		return
 	}
 
 	tunnelID := r.FormValue("tunnelId")
 	if tunnelID == "" {
-		http.Error(w, "ID tunnel non fornito", http.StatusBadRequest)
+		http.Error(w, "Tunnel ID not provided", http.StatusBadRequest)
 		return
 	}
 
@@ -294,33 +294,33 @@ func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	s.tunnelsMu.RUnlock()
 
 	if !ok {
-		http.Error(w, "Tunnel non trovato", http.StatusNotFound)
+		http.Error(w, "Tunnel not found", http.StatusNotFound)
 		return
 	}
 
-	log.Printf("Chiusura del tunnel %s su richiesta dalla dashboard", tunnelID)
+	log.Printf("Closing tunnel %s on dashboard request", tunnelID)
 	tunnel.Session.Close()
 
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-// getTLSConfig carica o genera una configurazione TLS.
+// getTLSConfig loads or generates a TLS configuration.
 func (s *Server) getTLSConfig(certFile, keyFile, host string) (*tls.Config, error) {
 	if _, err := os.Stat(certFile); os.IsNotExist(err) {
-		log.Printf("Certificato TLS non trovato (%s), ne genero uno nuovo.", certFile)
+		log.Printf("TLS certificate not found (%s), generating a new one.", certFile)
 		if err := generateSelfSignedCert(certFile, keyFile, host); err != nil {
-			return nil, fmt.Errorf("impossibile generare il certificato auto-firmato: %w", err)
+			return nil, fmt.Errorf("unable to generate self-signed certificate: %w", err)
 		}
 	}
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("impossibile caricare la coppia di chiavi/certificati TLS: %w", err)
+		return nil, fmt.Errorf("unable to load TLS key/certificate pair: %w", err)
 	}
 	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 }
 
-// generateSelfSignedCert crea un certificato e una chiave auto-firmati.
+// generateSelfSignedCert creates a self-signed certificate and key.
 func generateSelfSignedCert(certFile, keyFile, host string) error {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -371,7 +371,7 @@ func generateSelfSignedCert(certFile, keyFile, host string) error {
 	return nil
 }
 
-// ServeHTTP implementa l'interfaccia http.Handler per il reverse proxy.
+// ServeHTTP implements the http.Handler interface for the reverse proxy.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
 	// Strip port from Host header so lookup matches the stored key (subdomain.domain)
@@ -384,7 +384,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !ok {
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, "Tunnel per %s non trovato.", host)
+		fmt.Fprintf(w, "Tunnel for %s not found.", host)
 		return
 	}
 
@@ -398,7 +398,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Gestione per richieste HTTP normali
+	// Handle normal HTTP requests
 	s.handleHTTPRequest(w, r, t)
 }
 
@@ -421,24 +421,24 @@ func isSSERequest(r *http.Request) bool {
 // for SSE.
 func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
-	log.Printf("Richiesta %s per l'host %s", protocol, host)
+	log.Printf("%s request for host %s", protocol, host)
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Printf("Impossibile effettuare l'hijack della connessione per %s", protocol)
+		log.Printf("Unable to hijack connection for %s", protocol)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		log.Printf("Hijack fallito per %s: %v", protocol, err)
+		log.Printf("Hijack failed for %s: %v", protocol, err)
 		return
 	}
 	defer clientConn.Close()
 
 	stream, err := t.Session.OpenStream()
 	if err != nil {
-		log.Printf("Impossibile aprire una stream per la richiesta %s a %s: %v", protocol, host, err)
+		log.Printf("Unable to open stream for %s request to %s: %v", protocol, host, err)
 		return
 	}
 	defer stream.Close()
@@ -447,23 +447,23 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 	// the tunnel client needs the HTTP request before it can produce a response,
 	// and the proxy goroutines will start reading from both sides immediately.
 	if err := r.Write(stream); err != nil {
-		log.Printf("Errore durante la scrittura della richiesta %s sulla stream: %v", protocol, err)
+		log.Printf("Error writing %s request to stream: %v", protocol, err)
 		return
 	}
 
 	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut)
 	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
 
-	log.Printf("Avvio del proxy %s per %s", protocol, host)
+	log.Printf("Starting %s proxy for %s", protocol, host)
 	tunnel_pkg.Proxy(mClientConn, mStream)
-	log.Printf("Proxy %s per %s terminato", protocol, host)
+	log.Printf("%s proxy for %s terminated", protocol, host)
 }
 
 func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
 	stream, err := t.Session.OpenStream()
 	if err != nil {
-		log.Printf("Impossibile aprire una stream per l'host %s: %v", host, err)
+		log.Printf("Unable to open stream for host %s: %v", host, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -471,57 +471,57 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 
 	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
 
-	// Scrivi la richiesta HTTP nella stream del tunnel
+	// Write the HTTP request to the tunnel stream
 	if err := r.Write(mStream); err != nil {
-		log.Printf("Errore durante la scrittura della richiesta sulla stream: %v", err)
+		log.Printf("Error writing request to stream: %v", err)
 		return
 	}
 
-	// Leggi la risposta HTTP dalla stream del tunnel
+	// Read the HTTP response from the tunnel stream
 	resp, err := http.ReadResponse(bufio.NewReader(mStream), r)
 	if err != nil {
-		// Se c'è un errore nella lettura della risposta, potrebbe essere perché il client
-		// ha chiuso la connessione. In questo caso, non inviamo una risposta HTTP.
+		// If there is an error reading the response, it could be because the client
+		// closed the connection. In this case, do not send an HTTP response.
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
-			log.Printf("Errore durante la lettura della risposta dalla stream: %v", err)
+			log.Printf("Error reading response from stream: %v", err)
 		}
-		// Non possiamo inviare un header qui perché la connessione potrebbe essere in uno stato indeterminato.
-		// Proviamo a inviare un BadGateway, ma potrebbe fallire.
+		// We cannot send a header here because the connection may be in an indeterminate state.
+		// Try sending a BadGateway, but it may fail.
 		// w.WriteHeader(http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Copia gli header dalla risposta del tunnel alla risposta originale
+	// Copy headers from the tunnel response to the original response
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 
-	// Scrivi lo status code e il corpo della risposta
+	// Write the status code and the response body
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
 
-// handleClientConnection gestisce il ciclo di vita di un singolo client connesso.
+// handleClientConnection manages the lifecycle of a single connected client.
 func (s *Server) handleClientConnection(conn net.Conn) {
 	defer conn.Close()
-	log.Printf("Nuovo client connesso da %s", conn.RemoteAddr())
+	log.Printf("New client connected from %s", conn.RemoteAddr())
 
 	if !s.authenticate(conn) {
-		log.Printf("Autenticazione fallita per il client %s", conn.RemoteAddr())
+		log.Printf("Authentication failed for client %s", conn.RemoteAddr())
 		return
 	}
 
-	log.Printf("Client %s autenticato con successo", conn.RemoteAddr())
+	log.Printf("Client %s authenticated successfully", conn.RemoteAddr())
 
 	yamuxConfig := yamux.DefaultConfig()
 	yamuxConfig.KeepAliveInterval = s.config.KeepaliveInterval
 	yamuxConfig.ConnectionWriteTimeout = s.config.ConnectionWriteTimeout
 	session, err := yamux.Server(conn, yamuxConfig)
 	if err != nil {
-		log.Printf("Errore durante la creazione della sessione yamux per %s: %v", conn.RemoteAddr(), err)
+		log.Printf("Error creating yamux session for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 	defer session.Close()
@@ -530,25 +530,25 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 
 	ctrlStream, err := session.AcceptStream()
 	if err != nil {
-		log.Printf("Impossibile accettare la control stream da %s: %v", conn.RemoteAddr(), err)
+		log.Printf("Unable to accept control stream from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 	defer ctrlStream.Close()
 
-	log.Printf("Control stream accettata da %s. In attesa di richieste...", conn.RemoteAddr())
+	log.Printf("Control stream accepted from %s. Waiting for requests...", conn.RemoteAddr())
 
 	decoder := json.NewDecoder(ctrlStream)
 	for {
 		var msg protocol.ControlMessage
 		if err := decoder.Decode(&msg); err != nil {
-			log.Printf("Client %s disconnesso: %v", conn.RemoteAddr(), err)
+			log.Printf("Client %s disconnected: %v", conn.RemoteAddr(), err)
 			break
 		}
 
 		switch msg.Type {
 		case protocol.RequestTunnelType:
 			if err := s.handleRequestTunnel(&msg, session, ctrlStream); err != nil {
-				log.Printf("Errore durante la gestione della richiesta di tunnel: %v", err)
+				log.Printf("Error handling tunnel request: %v", err)
 			}
 		default:
 			log.Printf("Received unhandled message type: %s", msg.Type)
@@ -987,14 +987,14 @@ const dashboardTemplate = `
                 color: var(--header-color);
             }
             td:nth-of-type(1):before { content: "ID"; }
-            td:nth-of-type(2):before { content: "Tipo"; }
-            td:nth-of-type(3):before { content: "URL Pubblico"; }
+            td:nth-of-type(2):before { content: "Type"; }
+            td:nth-of-type(3):before { content: "Public URL"; }
             td:nth-of-type(4):before { content: "Client"; }
-            td:nth-of-type(5):before { content: "Stato"; }
-            td:nth-of-type(6):before { content: "Creato il"; }
-            td:nth-of-type(7):before { content: "Durata"; }
-            td:nth-of-type(8):before { content: "Traffico (In / Out)"; }
-            td:nth-of-type(9):before { content: "Azione"; }
+            td:nth-of-type(5):before { content: "Status"; }
+            td:nth-of-type(6):before { content: "Created"; }
+            td:nth-of-type(7):before { content: "Uptime"; }
+            td:nth-of-type(8):before { content: "Traffic (In / Out)"; }
+            td:nth-of-type(9):before { content: "Action"; }
         }
     </style>
 </head>
@@ -1022,21 +1022,21 @@ const dashboardTemplate = `
         </div>
 
         <div class="summary">
-            <p>Tunnel attivi: <span>{{ len . }}</span></p>
+            <p>Active tunnels: <span>{{ len . }}</span></p>
         </div>
 
         <table>
             <thead>
                 <tr>
                     <th>ID</th>
-                    <th>Tipo</th>
-                    <th>URL Pubblico</th>
+                    <th>Type</th>
+                    <th>Public URL</th>
                     <th>Client</th>
-                    <th>Stato</th>
-                    <th>Creato il</th>
-                    <th>Durata</th>
-                    <th>Traffico (In / Out)</th>
-                    <th>Azione</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th>Uptime</th>
+                    <th>Traffic (In / Out)</th>
+                    <th>Action</th>
                 </tr>
             </thead>
             <tbody>
@@ -1054,7 +1054,7 @@ const dashboardTemplate = `
                         <form method="POST" style="margin:0;">
                             <input type="hidden" name="csrf_token" value="{{ csrfToken }}">
                             <input type="hidden" name="tunnelId" value="{{ .ID }}">
-                            <button type="submit" class="action-button">Chiudi</button>
+                            <button type="submit" class="action-button">Close</button>
                         </form>
                     </td>
                 </tr>
