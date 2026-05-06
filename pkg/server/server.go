@@ -388,9 +388,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Gestione per WebSocket
 	if isWebSocketRequest(r) {
-		s.handleWebSocket(w, r, t)
+		s.handleHijackedRequest("WebSocket", w, r, t)
+		return
+	}
+
+	if isSSERequest(r) {
+		s.handleHijackedRequest("SSE", w, r, t)
 		return
 	}
 
@@ -403,50 +407,56 @@ func isWebSocketRequest(r *http.Request) bool {
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, t *Tunnel) {
-	host := r.Host
-	log.Printf("Richiesta WebSocket per l'host %s", host)
+func isSSERequest(r *http.Request) bool {
+	accept := strings.ToLower(r.Header.Get("Accept"))
+	return accept == "text/event-stream" || strings.HasPrefix(accept, "text/event-stream;")
+}
 
-	// Hijack della connessione per ottenere la connessione TCP sottostante
+// handleHijackedRequest manages protocols (WebSocket, SSE) that require
+// connection hijacking instead of a standard request/response cycle.
+// After hijacking, the raw TCP connection is proxied bidirectionally to the
+// tunnel client. The tunnel client is responsible for producing the full HTTP
+// response (status line + headers + body), including protocol-specific headers
+// such as Upgrade/Connection for WebSocket or Content-Type: text/event-stream
+// for SSE.
+func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r *http.Request, t *Tunnel) {
+	host := r.Host
+	log.Printf("Richiesta %s per l'host %s", protocol, host)
+
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		log.Printf("Impossibile effettuare l'hijack della connessione per WebSocket")
+		log.Printf("Impossibile effettuare l'hijack della connessione per %s", protocol)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
-		log.Printf("Hijack fallito per WebSocket: %v", err)
-		// Non possiamo inviare una risposta HTTP, la connessione è andata
+		log.Printf("Hijack fallito per %s: %v", protocol, err)
 		return
 	}
 	defer clientConn.Close()
 
-	// Apri lo stream verso il client del tunnel
 	stream, err := t.Session.OpenStream()
 	if err != nil {
-		log.Printf("Impossibile aprire una stream per la richiesta WebSocket a %s: %v", host, err)
+		log.Printf("Impossibile aprire una stream per la richiesta %s a %s: %v", protocol, host, err)
 		return
 	}
 	defer stream.Close()
 
-	// Inoltra la richiesta di upgrade originale al client
-	// È importante che questa richiesta venga scritta prima di iniziare a leggere dalla connessione del client,
-	// altrimenti si potrebbe creare un deadlock.
+	// Write the request before starting the proxy to avoid a deadlock:
+	// the tunnel client needs the HTTP request before it can produce a response,
+	// and the proxy goroutines will start reading from both sides immediately.
 	if err := r.Write(stream); err != nil {
-		log.Printf("Errore durante la scrittura della richiesta di upgrade WebSocket sulla stream: %v", err)
+		log.Printf("Errore durante la scrittura della richiesta %s sulla stream: %v", protocol, err)
 		return
 	}
 
-	// A questo punto, la connessione HTTP è stata "promossa" a una connessione TCP bidirezionale.
-	// Dobbiamo fare da proxy tra la connessione del browser (clientConn) e la stream del tunnel.
-	// Questo gestirà la risposta 101 e il successivo traffico WebSocket.
 	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut)
 	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
 
-	log.Printf("Avvio del proxy WebSocket per %s", host)
+	log.Printf("Avvio del proxy %s per %s", protocol, host)
 	tunnel_pkg.Proxy(mClientConn, mStream)
-	log.Printf("Proxy WebSocket per %s terminato", host)
+	log.Printf("Proxy %s per %s terminato", protocol, host)
 }
 
 func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel) {
