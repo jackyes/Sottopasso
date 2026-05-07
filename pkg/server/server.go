@@ -209,7 +209,12 @@ func (s *Server) startHTTPListener() {
 		return
 	}
 
-	s.httpServer = &http.Server{Addr: s.config.HTTPAddr, Handler: s}
+	s.httpServer = &http.Server{
+		Addr:              s.config.HTTPAddr,
+		Handler:           s,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	if s.config.HTTPUseTLS {
 		log.Printf("HTTPS listener listening on %s", s.config.HTTPAddr)
@@ -317,7 +322,10 @@ func (s *Server) getTLSConfig(certFile, keyFile, host string) (*tls.Config, erro
 	if err != nil {
 		return nil, fmt.Errorf("unable to load TLS key/certificate pair: %w", err)
 	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 // generateSelfSignedCert creates a self-signed certificate and key.
@@ -408,8 +416,7 @@ func isWebSocketRequest(r *http.Request) bool {
 }
 
 func isSSERequest(r *http.Request) bool {
-	accept := strings.ToLower(r.Header.Get("Accept"))
-	return accept == "text/event-stream" || strings.HasPrefix(accept, "text/event-stream;")
+	return r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 }
 
 // handleHijackedRequest manages protocols (WebSocket, SSE) that require
@@ -537,10 +544,9 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 
 	log.Printf("Control stream accepted from %s. Waiting for requests...", conn.RemoteAddr())
 
-	decoder := json.NewDecoder(ctrlStream)
 	for {
 		var msg protocol.ControlMessage
-		if err := decoder.Decode(&msg); err != nil {
+		if err := json.NewDecoder(io.LimitReader(ctrlStream, 1<<20)).Decode(&msg); err != nil {
 			log.Printf("Client %s disconnected: %v", conn.RemoteAddr(), err)
 			break
 		}
@@ -609,11 +615,16 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	var subdomain string
 	var host string
 
+	domain := s.config.Domain
+	if h, _, err := net.SplitHostPort(domain); err == nil {
+		domain = h
+	}
+
 	s.httpTunnelsMu.Lock()
 	defer s.httpTunnelsMu.Unlock()
 
 	if req.Subdomain != "" {
-		potentialHost := fmt.Sprintf("%s.%s", req.Subdomain, s.config.Domain)
+		potentialHost := fmt.Sprintf("%s.%s", req.Subdomain, domain)
 		if _, exists := s.httpTunnels[potentialHost]; !exists {
 			subdomain = req.Subdomain
 			host = potentialHost
@@ -626,7 +637,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	if host == "" {
 		for {
 			subdomain = uuid.New().String()[:8]
-			host = fmt.Sprintf("%s.%s", subdomain, s.config.Domain)
+			host = fmt.Sprintf("%s.%s", subdomain, domain)
 			if _, exists := s.httpTunnels[host]; !exists {
 				break
 			}
@@ -741,7 +752,7 @@ func (s *Server) authenticate(conn net.Conn) bool {
 	defer conn.SetReadDeadline(time.Time{}) // Clear deadline after auth
 
 	var msg protocol.ControlMessage
-	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
+	if err := json.NewDecoder(io.LimitReader(conn, 1<<20)).Decode(&msg); err != nil {
 		log.Printf("Error decoding auth message: %v", err)
 		return false
 	}

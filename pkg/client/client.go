@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync/atomic"
@@ -108,7 +109,7 @@ func (c *Client) requestTunnel(ctrlStream net.Conn) (string, error) {
 	}
 
 	var respMsg protocol.ControlMessage
-	if err := json.NewDecoder(ctrlStream).Decode(&respMsg); err != nil {
+	if err := json.NewDecoder(io.LimitReader(ctrlStream, 1<<20)).Decode(&respMsg); err != nil {
 		return "", fmt.Errorf("unable to decode tunnel response: %w", err)
 	}
 
@@ -166,7 +167,7 @@ func (c *Client) authenticate(conn net.Conn) error {
 
 	// Wait and read the server's response
 	var respMsg protocol.ControlMessage
-	if err := json.NewDecoder(conn).Decode(&respMsg); err != nil {
+	if err := json.NewDecoder(io.LimitReader(conn, 1<<20)).Decode(&respMsg); err != nil {
 		return fmt.Errorf("error decoding auth response: %w", err)
 	}
 
