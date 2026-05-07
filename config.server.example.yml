@@ -1,0 +1,46 @@
+# Configuration file for the Tunnel Server
+#
+# Copy this file to config.server.yml and fill in your values.
+# config.server.yml is git-ignored and will never be committed.
+
+# Address for the client control channel (TLS)
+control_addr: ":7780"
+
+# Address for public HTTP/HTTPS traffic
+http_addr: ":80"
+
+# Enable TLS for public traffic (HTTPS)
+http_use_tls: true
+
+# Base domain used to generate HTTP tunnel URLs
+domain: "tunnel.example.com"
+
+# Paths for the TLS certificate and key files.
+tls_cert_file: "/etc/letsencrypt/live/example.com/fullchain.pem"
+tls_key_file: "/etc/letsencrypt/live/example.com/privkey.pem"
+
+# List of valid authentication tokens for clients.
+# Generate strong random tokens (e.g., openssl rand -hex 32).
+valid_tokens:
+  - "your-secret-token-here"
+
+# Keepalive interval for the connection (e.g., 30s, 1m, 1h)
+keepalive_interval: "30s"
+
+# Write timeout for the connection (e.g., 10s, 1m)
+connection_write_timeout: "30s"
+
+# --- Status Dashboard Configuration ---
+
+# Address for the status dashboard (e.g., ":4040")
+dashboard_addr: ":4040"
+
+# (Optional) Credentials to protect dashboard access with Basic Auth.
+# Remove or leave empty to disable authentication.
+dashboard_username: "admin"
+dashboard_password: "change-me"
+
+# (Optional) Paths for dashboard TLS files. If omitted, the dashboard will use HTTP.
+# If not found, they will be automatically generated.
+# dashboard_tls_cert_file: "/etc/letsencrypt/live/example.com/fullchain.pem"
+# dashboard_tls_key_file: "/etc/letsencrypt/live/example.com/privkey.pem"

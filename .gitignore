@@ -1,0 +1,22 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Config files with secrets — keep the .example templates tracked
+config.client.yml
+config.server.yml
+config.client.*.yml
+!config.client.example.yml
+!config.server.example.yml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
