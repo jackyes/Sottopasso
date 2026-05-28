@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -539,6 +540,59 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	io.Copy(w, resp.Body)
 }
 
+// maxControlMessageSize bounds the bytes a single control message may occupy on the wire.
+const maxControlMessageSize = 1 << 20 // 1 MiB
+
+// errControlMessageTooLarge is returned once a single message exceeds maxControlMessageSize.
+var errControlMessageTooLarge = errors.New("control message exceeds maximum size")
+
+// resettableLimitReader is an io.LimitReader whose budget can be restored with reset,
+// so a single json.Decoder can be reused across messages while still bounding each one.
+type resettableLimitReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (l *resettableLimitReader) Read(p []byte) (int, error) {
+	if l.remaining <= 0 {
+		return 0, errControlMessageTooLarge
+	}
+	if int64(len(p)) > l.remaining {
+		p = p[:l.remaining]
+	}
+	n, err := l.r.Read(p)
+	l.remaining -= int64(n)
+	return n, err
+}
+
+func (l *resettableLimitReader) reset(limit int64) {
+	l.remaining = limit
+}
+
+// serveControlStream decodes and dispatches a client's control messages until the stream closes or a decode error occurs.
+func (s *Server) serveControlStream(session *yamux.Session, ctrlStream net.Conn) {
+	// Reuse one decoder for the stream's lifetime: a fresh decoder per message would discard bytes it buffered past the current message, silently dropping pipelined messages.
+	limited := &resettableLimitReader{r: ctrlStream, remaining: maxControlMessageSize}
+	dec := json.NewDecoder(limited)
+	for {
+		var msg protocol.ControlMessage
+		if err := dec.Decode(&msg); err != nil {
+			log.Printf("Client %s disconnected: %v", session.RemoteAddr(), err)
+			return
+		}
+		limited.reset(maxControlMessageSize) // restore the per-message size budget
+
+		switch msg.Type {
+		case protocol.RequestTunnelType:
+			if err := s.handleRequestTunnel(&msg, session, ctrlStream); err != nil {
+				log.Printf("Error handling tunnel request: %v", err)
+			}
+		default:
+			log.Printf("Received unhandled message type: %s", msg.Type)
+		}
+	}
+}
+
 // handleClientConnection manages the lifecycle of a single connected client.
 func (s *Server) handleClientConnection(conn net.Conn) {
 	defer conn.Close()
@@ -572,22 +626,7 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 
 	log.Printf("Control stream accepted from %s. Waiting for requests...", conn.RemoteAddr())
 
-	for {
-		var msg protocol.ControlMessage
-		if err := json.NewDecoder(io.LimitReader(ctrlStream, 1<<20)).Decode(&msg); err != nil {
-			log.Printf("Client %s disconnected: %v", conn.RemoteAddr(), err)
-			break
-		}
-
-		switch msg.Type {
-		case protocol.RequestTunnelType:
-			if err := s.handleRequestTunnel(&msg, session, ctrlStream); err != nil {
-				log.Printf("Error handling tunnel request: %v", err)
-			}
-		default:
-			log.Printf("Received unhandled message type: %s", msg.Type)
-		}
-	}
+	s.serveControlStream(session, ctrlStream)
 
 	log.Printf("Connection with client %s terminated.", conn.RemoteAddr())
 }
@@ -780,7 +819,7 @@ func (s *Server) authenticate(conn net.Conn) bool {
 	defer conn.SetReadDeadline(time.Time{}) // Clear deadline after auth
 
 	var msg protocol.ControlMessage
-	if err := json.NewDecoder(io.LimitReader(conn, 1<<20)).Decode(&msg); err != nil {
+	if err := json.NewDecoder(io.LimitReader(conn, maxControlMessageSize)).Decode(&msg); err != nil {
 		log.Printf("Error decoding auth message: %v", err)
 		return false
 	}

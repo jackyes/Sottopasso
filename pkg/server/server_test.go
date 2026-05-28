@@ -3,6 +3,7 @@ package server
 import (
 	"Sottopasso/pkg/protocol"
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -673,6 +674,88 @@ func TestSetupTCPTunnel(t *testing.T) {
 		if tn.Type != "tcp" {
 			t.Errorf("tunnel type=%q, want tcp", tn.Type)
 		}
+	}
+}
+
+// --- serveControlStream (pipelined control messages) ---
+
+// Two control messages written back-to-back in a single write must both be
+// processed. A fresh json.Decoder per loop iteration discards the bytes the
+// first decoder buffered past message one, silently dropping the second; reusing
+// one decoder across the loop fixes it.
+func TestServeControlStream_ProcessesPipelinedMessages(t *testing.T) {
+	s := New(&Config{Domain: "localhost"})
+	serverSess, clientSess := newYamuxPair(t)
+
+	clientStream, err := clientSess.OpenStream()
+	if err != nil {
+		t.Fatalf("open control stream: %v", err)
+	}
+	serverStream, err := serverSess.AcceptStream()
+	if err != nil {
+		t.Fatalf("accept control stream: %v", err)
+	}
+
+	go s.serveControlStream(serverSess, serverStream)
+
+	// Encode two RequestTunnel messages, then deliver them in a single write so
+	// they arrive pipelined on the stream.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, sub := range []string{"one", "two"} {
+		payload, _ := json.Marshal(protocol.RequestTunnel{Type: "http", Subdomain: sub})
+		if err := enc.Encode(protocol.ControlMessage{Type: protocol.RequestTunnelType, RawPayload: payload}); err != nil {
+			t.Fatalf("encode control message: %v", err)
+		}
+	}
+	if _, err := clientStream.Write(buf.Bytes()); err != nil {
+		t.Fatalf("write pipelined messages: %v", err)
+	}
+
+	// Read both responses with a SINGLE decoder; a per-response decoder would have
+	// the same buffering hazard on the client side.
+	dec := json.NewDecoder(clientStream)
+	got := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		if err := clientStream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var resp protocol.ControlMessage
+		if err := dec.Decode(&resp); err != nil {
+			t.Fatalf("decoding response %d failed (a dropped pipelined message indicates the decoder-reuse regression): %v", i+1, err)
+		}
+		if resp.Type != protocol.TunnelResponseType {
+			t.Fatalf("response %d type=%q, want %q", i+1, resp.Type, protocol.TunnelResponseType)
+		}
+		var tr protocol.TunnelResponse
+		if err := json.Unmarshal(resp.RawPayload, &tr); err != nil {
+			t.Fatalf("unmarshal TunnelResponse %d: %v", i+1, err)
+		}
+		got[tr.PublicURL] = true
+	}
+
+	if !got["http://one.localhost"] || !got["http://two.localhost"] {
+		t.Errorf("expected both pipelined tunnel requests processed, got responses for %v", got)
+	}
+}
+
+// resettableLimitReader must bound a single message like io.LimitReader yet allow
+// the budget to be restored so the shared decoder can read the next message.
+func TestResettableLimitReader_BoundsAndResets(t *testing.T) {
+	r := &resettableLimitReader{r: strings.NewReader(strings.Repeat("a", 100)), remaining: 10}
+
+	buf := make([]byte, 32)
+	n, err := io.ReadFull(r, buf[:10])
+	if err != nil || n != 10 {
+		t.Fatalf("read within budget: n=%d err=%v, want 10/nil", n, err)
+	}
+	if _, err := r.Read(buf); err != errControlMessageTooLarge {
+		t.Fatalf("read past budget: err=%v, want errControlMessageTooLarge", err)
+	}
+
+	r.reset(10)
+	if n, err := r.Read(buf); err != nil || n == 0 {
+		t.Fatalf("read after reset: n=%d err=%v, want >0/nil", n, err)
 	}
 }
 
