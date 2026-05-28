@@ -419,6 +419,22 @@ func isSSERequest(r *http.Request) bool {
 	return r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 }
 
+// prefixConn is a net.Conn that returns a prefix of already-buffered bytes
+// before delegating further reads to the underlying connection.
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
 // handleHijackedRequest manages protocols (WebSocket, SSE) that require
 // connection hijacking instead of a standard request/response cycle.
 // After hijacking, the raw TCP connection is proxied bidirectionally to the
@@ -436,7 +452,7 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, bufrw, err := hijacker.Hijack()
 	if err != nil {
 		log.Printf("Hijack failed for %s: %v", protocol, err)
 		return
@@ -456,6 +472,18 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 	if err := r.Write(stream); err != nil {
 		log.Printf("Error writing %s request to stream: %v", protocol, err)
 		return
+	}
+
+	// The HTTP server may have buffered bytes the client sent immediately after
+	// the request (e.g. an early WebSocket frame) while parsing the headers.
+	// Recover them from the hijacked reader so they are forwarded rather than lost.
+	if bufrw != nil {
+		if n := bufrw.Reader.Buffered(); n > 0 {
+			buffered := make([]byte, n)
+			if _, err := io.ReadFull(bufrw.Reader, buffered); err == nil {
+				clientConn = &prefixConn{Conn: clientConn, prefix: buffered}
+			}
+		}
 	}
 
 	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut)
