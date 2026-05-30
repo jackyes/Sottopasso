@@ -487,8 +487,11 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 		}
 	}
 
+	// Account traffic once, at the public boundary (clientConn). The stream relays
+	// the same bytes, so measuring it too would double every reported figure.
+	var ignoreIn, ignoreOut atomic.Uint64
 	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut)
-	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
+	mStream := tunnel_pkg.NewMeasuredConn(stream, &ignoreIn, &ignoreOut)
 
 	log.Printf("Starting %s proxy for %s", protocol, host)
 	tunnel_pkg.Proxy(mClientConn, mStream)
@@ -802,8 +805,11 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 				}
 				defer stream.Close()
 
+				// Account traffic once, at the public boundary. The stream relays the
+				// same bytes, so measuring it too would double every reported figure.
+				var ignoreIn, ignoreOut atomic.Uint64
 				mPublicConn := tunnel_pkg.NewMeasuredConn(publicConn, &tunnel.TotalBytesIn, &tunnel.TotalBytesOut)
-				mStream := tunnel_pkg.NewMeasuredConn(stream, &tunnel.TotalBytesOut, &tunnel.TotalBytesIn)
+				mStream := tunnel_pkg.NewMeasuredConn(stream, &ignoreIn, &ignoreOut)
 
 				tunnel_pkg.Proxy(mPublicConn, mStream)
 			}(publicConn)

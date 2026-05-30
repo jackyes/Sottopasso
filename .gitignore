@@ -11,6 +11,10 @@ config.client.*.yml
 !config.client.example.yml
 !config.server.example.yml
 
+# Test/coverage artifacts
+*.out
+coverage.html
+
 # IDE
 .idea/
 .vscode/

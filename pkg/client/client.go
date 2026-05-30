@@ -142,9 +142,11 @@ func (c *Client) handleServerStream(stream net.Conn) {
 	}
 	defer localConn.Close()
 
-	var bytesIn, bytesOut atomic.Uint64
+	// Account traffic once, on the server-facing stream. localConn relays the same
+	// bytes, so measuring it too would double the reported figures.
+	var bytesIn, bytesOut, ignoreIn, ignoreOut atomic.Uint64
 	mStream := tunnel.NewMeasuredConn(stream, &bytesIn, &bytesOut)
-	mLocalConn := tunnel.NewMeasuredConn(localConn, &bytesOut, &bytesIn)
+	mLocalConn := tunnel.NewMeasuredConn(localConn, &ignoreIn, &ignoreOut)
 
 	tunnel.Proxy(mStream, mLocalConn)
 
