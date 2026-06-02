@@ -3,6 +3,7 @@ package client
 import (
 	"Sottopasso/pkg/protocol"
 	"Sottopasso/pkg/tunnel"
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,8 @@ type Config struct {
 	InsecureSkipVerify     bool          // If true, ignores server TLS certificate verification
 	KeepaliveInterval      time.Duration // Keepalive interval for yamux session
 	ConnectionWriteTimeout time.Duration // Write timeout for yamux connection
+	MaxConcurrentStreams   int           // Max concurrent server-opened streams handled at once (0 = unlimited)
+	DialTimeout            time.Duration // Timeout dialing the local service (0 = no timeout)
 }
 
 // Client is the main structure of our tunnel client.
@@ -38,6 +41,22 @@ func New(config *Config) *Client {
 	return &Client{
 		config: config,
 	}
+}
+
+// prefixConn returns buffered bytes before delegating to the underlying conn, so bytes
+// a json.Decoder read past the auth response are not lost when yamux takes over.
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
 }
 
 // Start connects to the server, authenticates, and manages the tunnel.
@@ -54,7 +73,8 @@ func (c *Client) Start() error {
 
 	log.Println("TLS connection established. Authenticating...")
 
-	if err := c.authenticate(conn); err != nil {
+	sessionConn, err := c.authenticate(conn)
+	if err != nil {
 		return fmt.Errorf("authentication failed: %w", err)
 	}
 
@@ -64,7 +84,7 @@ func (c *Client) Start() error {
 	yamuxConfig.KeepAliveInterval = c.config.KeepaliveInterval
 	yamuxConfig.ConnectionWriteTimeout = c.config.ConnectionWriteTimeout
 
-	session, err := yamux.Client(conn, yamuxConfig)
+	session, err := yamux.Client(sessionConn, yamuxConfig)
 	if err != nil {
 		return fmt.Errorf("unable to create yamux session: %w", err)
 	}
@@ -82,12 +102,24 @@ func (c *Client) Start() error {
 	log.Printf("Public tunnel available at: %s", publicURL)
 	log.Printf("Forwarding to: localhost:%d", c.config.LocalPort)
 
+	var sem chan struct{}
+	if c.config.MaxConcurrentStreams > 0 {
+		sem = make(chan struct{}, c.config.MaxConcurrentStreams)
+	}
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
 			return fmt.Errorf("session terminated: %w", err)
 		}
-		go c.handleServerStream(stream)
+		if sem != nil {
+			sem <- struct{}{} // backpressure: stop accepting once at capacity
+		}
+		go func(stream net.Conn) {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			c.handleServerStream(stream)
+		}(stream)
 	}
 }
 
@@ -135,7 +167,14 @@ func (c *Client) handleServerStream(stream net.Conn) {
 	connID := uuid.New().String()[:8]
 	log.Printf("[%s] New connection from server, forwarding to localhost:%d.", connID, c.config.LocalPort)
 
-	localConn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", c.config.LocalPort))
+	addr := fmt.Sprintf("localhost:%d", c.config.LocalPort)
+	var localConn net.Conn
+	var err error
+	if c.config.DialTimeout > 0 {
+		localConn, err = net.DialTimeout("tcp", addr, c.config.DialTimeout)
+	} else {
+		localConn, err = net.Dial("tcp", addr)
+	}
 	if err != nil {
 		log.Printf("[%s] Unable to connect to local service: %v", connID, err)
 		return
@@ -154,7 +193,7 @@ func (c *Client) handleServerStream(stream net.Conn) {
 }
 
 // authenticate sends credentials and waits for the server's response.
-func (c *Client) authenticate(conn net.Conn) error {
+func (c *Client) authenticate(conn net.Conn) (net.Conn, error) {
 	// Create and send the AuthRequest message
 	authReq := protocol.AuthRequest{AuthToken: c.config.AuthToken}
 	payload, _ := json.Marshal(authReq)
@@ -164,27 +203,36 @@ func (c *Client) authenticate(conn net.Conn) error {
 	}
 
 	if err := json.NewEncoder(conn).Encode(msg); err != nil {
-		return fmt.Errorf("error sending auth request: %w", err)
+		return conn, fmt.Errorf("error sending auth request: %w", err)
 	}
 
-	// Wait and read the server's response
+	// Wait and read the server's response. Keep the decoder so any bytes it buffers
+	// past the response can be handed to yamux instead of being dropped.
+	dec := json.NewDecoder(io.LimitReader(conn, 1<<20))
 	var respMsg protocol.ControlMessage
-	if err := json.NewDecoder(io.LimitReader(conn, 1<<20)).Decode(&respMsg); err != nil {
-		return fmt.Errorf("error decoding auth response: %w", err)
+	if err := dec.Decode(&respMsg); err != nil {
+		return conn, fmt.Errorf("error decoding auth response: %w", err)
 	}
 
 	if respMsg.Type != protocol.AuthResponseType {
-		return fmt.Errorf("received unexpected message type %s", respMsg.Type)
+		return conn, fmt.Errorf("received unexpected message type %s", respMsg.Type)
 	}
 
 	var authResp protocol.AuthResponse
 	if err := json.Unmarshal(respMsg.RawPayload, &authResp); err != nil {
-		return fmt.Errorf("error unmarshaling AuthResponse payload: %w", err)
+		return conn, fmt.Errorf("error unmarshaling AuthResponse payload: %w", err)
 	}
 
 	if !authResp.Success {
-		return fmt.Errorf("server rejected authentication: %s", authResp.Error)
+		return conn, fmt.Errorf("server rejected authentication: %s", authResp.Error)
 	}
 
-	return nil
+	// dec.Buffered() holds the JSON-lines delimiter (a trailing newline) plus any bytes
+	// the peer pipelined after it. Trim the inter-message whitespace; whatever remains is
+	// genuine session data (yamux frames never start with ASCII whitespace).
+	buffered, _ := io.ReadAll(dec.Buffered())
+	if buffered = bytes.TrimLeft(buffered, " \t\r\n"); len(buffered) > 0 {
+		return &prefixConn{Conn: conn, prefix: buffered}, nil
+	}
+	return conn, nil
 }

@@ -29,6 +29,12 @@ type ConfigYAML struct {
 	DashboardTLSKeyFile    string   `yaml:"dashboard_tls_key_file"`
 	KeepaliveInterval      string   `yaml:"keepalive_interval"`
 	ConnectionWriteTimeout string   `yaml:"connection_write_timeout"`
+	MaxTunnelsPerSession   int      `yaml:"max_tunnels_per_session"`
+	MaxConnsPerTunnel      int      `yaml:"max_conns_per_tunnel"`
+	MaxControlConnections  int      `yaml:"max_control_connections"`
+	HTTPReadTimeout        string   `yaml:"http_read_timeout"`
+	HTTPWriteTimeout       string   `yaml:"http_write_timeout"`
+	MaxHTTPRequestBytes    int64    `yaml:"max_http_request_bytes"`
 }
 
 func main() {
@@ -43,9 +49,15 @@ func main() {
 	}
 
 	var configYAML ConfigYAML
-	// Set default values before unmarshaling
+	// Set default values before unmarshaling. Resource limits default to protective
+	// values; set any of them to 0 in the YAML to disable that limit.
 	configYAML.KeepaliveInterval = "30s"
 	configYAML.ConnectionWriteTimeout = "10s"
+	configYAML.MaxTunnelsPerSession = 100
+	configYAML.MaxConnsPerTunnel = 256
+	configYAML.MaxControlConnections = 512
+	configYAML.HTTPReadTimeout = "0s"
+	configYAML.HTTPWriteTimeout = "0s"
 	if err := yaml.Unmarshal(yamlFile, &configYAML); err != nil {
 		log.Fatalf("Error parsing YAML file: %v", err)
 	}
@@ -75,6 +87,16 @@ func main() {
 		log.Fatalf("Invalid connection_write_timeout format: %v", err)
 	}
 
+	httpReadTimeout, err := time.ParseDuration(configYAML.HTTPReadTimeout)
+	if err != nil {
+		log.Fatalf("Invalid http_read_timeout format: %v", err)
+	}
+
+	httpWriteTimeout, err := time.ParseDuration(configYAML.HTTPWriteTimeout)
+	if err != nil {
+		log.Fatalf("Invalid http_write_timeout format: %v", err)
+	}
+
 	config := &server.Config{
 		ControlAddr:            configYAML.ControlAddr,
 		HTTPAddr:               configYAML.HTTPAddr,
@@ -90,6 +112,12 @@ func main() {
 		DashboardTLSKeyFile:    configYAML.DashboardTLSKeyFile,
 		KeepaliveInterval:      keepalive,
 		ConnectionWriteTimeout: writeTimeout,
+		MaxTunnelsPerSession:   configYAML.MaxTunnelsPerSession,
+		MaxConnsPerTunnel:      configYAML.MaxConnsPerTunnel,
+		MaxControlConnections:  configYAML.MaxControlConnections,
+		HTTPReadTimeout:        httpReadTimeout,
+		HTTPWriteTimeout:       httpWriteTimeout,
+		MaxHTTPRequestBytes:    configYAML.MaxHTTPRequestBytes,
 	}
 
 	srv := server.New(config)

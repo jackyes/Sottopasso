@@ -36,7 +36,7 @@ func TestAuthenticate_Success(t *testing.T) {
 	defer c2.Close()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- c.authenticate(c1) }()
+	go func() { _, err := c.authenticate(c1); errCh <- err }()
 
 	// Server side reads the auth request and verifies it.
 	req := decode(t, c2)
@@ -62,7 +62,7 @@ func TestAuthenticate_ServerRejects(t *testing.T) {
 	defer c2.Close()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- c.authenticate(c1) }()
+	go func() { _, err := c.authenticate(c1); errCh <- err }()
 
 	decode(t, c2)
 	reply(t, c2, protocol.AuthResponseType, protocol.AuthResponse{Success: false, Error: "bad creds"})
@@ -83,7 +83,7 @@ func TestAuthenticate_UnexpectedResponseType(t *testing.T) {
 	defer c2.Close()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- c.authenticate(c1) }()
+	go func() { _, err := c.authenticate(c1); errCh <- err }()
 
 	decode(t, c2)
 	reply(t, c2, protocol.TunnelResponseType, protocol.TunnelResponse{PublicURL: "x"})

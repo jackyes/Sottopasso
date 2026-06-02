@@ -23,6 +23,8 @@ type ConfigYAML struct {
 	Subdomain              string `yaml:"subdomain"`
 	KeepaliveInterval      string `yaml:"keepalive_interval"`
 	ConnectionWriteTimeout string `yaml:"connection_write_timeout"`
+	MaxConcurrentStreams   int    `yaml:"max_concurrent_streams"`
+	DialTimeout            string `yaml:"dial_timeout"`
 }
 
 func main() {
@@ -60,7 +62,7 @@ func main() {
 		}
 		*localPort = port
 	} else if len(args) > 0 && (*tunnelType != "" || *localPort != 0) {
-		log.Printf("Warning: Ignoring positional arguments because flags were provided")
+		log.Fatal("Conflicting arguments: provide the tunnel as flags OR as positional [protocol] [port], not both. Use --help for usage.")
 	}
 
 	// Load configuration from YAML
@@ -71,10 +73,16 @@ func main() {
 		LocalPort:              8080,   // Default value
 		KeepaliveInterval:      "30s",  // Default value
 		ConnectionWriteTimeout: "10s",  // Default value
+		MaxConcurrentStreams:   256,    // Default value
+		DialTimeout:            "10s",  // Default value
 	}
 	yamlFile, err := os.ReadFile(*configPath)
 	if err == nil {
-		yaml.Unmarshal(yamlFile, &configYAML)
+		// A malformed config must not be silently ignored: partial application would
+		// leave fields (e.g. insecure_skip_verify) at insecure built-in defaults.
+		if err := yaml.Unmarshal(yamlFile, &configYAML); err != nil {
+			log.Fatalf("Error parsing YAML file %s: %v", *configPath, err)
+		}
 	}
 
 	// Override configuration with flags if provided
@@ -123,6 +131,11 @@ func main() {
 		log.Fatalf("Invalid connection_write_timeout format: %v", err)
 	}
 
+	dialTimeout, err := time.ParseDuration(configYAML.DialTimeout)
+	if err != nil {
+		log.Fatalf("Invalid dial_timeout format: %v", err)
+	}
+
 	// Create final configuration for the client
 	config := &client.Config{
 		ServerAddr:             configYAML.ServerAddr,
@@ -133,6 +146,12 @@ func main() {
 		InsecureSkipVerify:     configYAML.InsecureSkipVerify,
 		KeepaliveInterval:      keepalive,
 		ConnectionWriteTimeout: writeTimeout,
+		MaxConcurrentStreams:   configYAML.MaxConcurrentStreams,
+		DialTimeout:            dialTimeout,
+	}
+
+	if config.TunnelType != "http" && config.TunnelType != "tcp" {
+		log.Fatalf("Invalid tunnel protocol %q: must be \"http\" or \"tcp\".", config.TunnelType)
 	}
 
 	if config.AuthToken == "" {

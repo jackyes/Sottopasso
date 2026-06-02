@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -141,12 +143,12 @@ func okHandler() http.Handler {
 	})
 }
 
-func TestBasicAuth_NoCredentialsConfiguredPassesThrough(t *testing.T) {
-	s := New(&Config{}) // empty user/pass
+func TestBasicAuth_NoCredentialsConfiguredDenies(t *testing.T) {
+	s := New(&Config{}) // empty user/pass -> fail closed
 	rec := httptest.NewRecorder()
 	s.basicAuth(okHandler()).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
-	if rec.Code != http.StatusOK {
-		t.Errorf("code=%d, want 200 (auth disabled when creds empty)", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("code=%d, want 503 (dashboard must fail closed when creds empty)", rec.Code)
 	}
 }
 
@@ -215,6 +217,15 @@ func TestServeHTTP_UnknownHost404(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "not found") {
 		t.Errorf("body=%q, want a not-found message", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type=%q, want text/plain", ct)
+	}
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("expected X-Content-Type-Options: nosniff on 404")
+	}
+	if strings.Contains(rec.Body.String(), "nope") {
+		t.Error("404 body must not reflect the attacker-controlled Host header")
 	}
 }
 
@@ -485,7 +496,7 @@ func TestAuthenticate_ValidToken(t *testing.T) {
 	defer c2.Close()
 
 	res := make(chan bool, 1)
-	go func() { res <- s.authenticate(c1) }()
+	go func() { _, ok := s.authenticate(c1); res <- ok }()
 
 	sendControl(t, c2, protocol.AuthRequestType, protocol.AuthRequest{AuthToken: "good-token"})
 
@@ -513,7 +524,7 @@ func TestAuthenticate_InvalidToken(t *testing.T) {
 	defer c2.Close()
 
 	res := make(chan bool, 1)
-	go func() { res <- s.authenticate(c1) }()
+	go func() { _, ok := s.authenticate(c1); res <- ok }()
 
 	sendControl(t, c2, protocol.AuthRequestType, protocol.AuthRequest{AuthToken: "bad-token"})
 
@@ -541,7 +552,7 @@ func TestAuthenticate_WrongFirstMessageType(t *testing.T) {
 	defer c2.Close()
 
 	res := make(chan bool, 1)
-	go func() { res <- s.authenticate(c1) }()
+	go func() { _, ok := s.authenticate(c1); res <- ok }()
 
 	// First message is a tunnel request rather than auth -> must be rejected,
 	// and (since no response is sent) authenticate returns immediately.
@@ -549,6 +560,56 @@ func TestAuthenticate_WrongFirstMessageType(t *testing.T) {
 
 	if got := <-res; got {
 		t.Error("authenticate returned true for a non-auth first message")
+	}
+}
+
+// SOTTO-13: bytes a peer pipelines right after the auth request must survive the
+// handover to yamux. authenticate returns a conn that replays those buffered bytes,
+// while the JSON-lines trailing newline is correctly discarded.
+func TestAuthenticate_PreservesPipelinedBytes(t *testing.T) {
+	s := New(&Config{ValidTokens: []string{"good"}})
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	type result struct {
+		conn net.Conn
+		ok   bool
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		conn, ok := s.authenticate(c1)
+		resCh <- result{conn, ok}
+	}()
+
+	// Auth request (Encoder adds the trailing newline) immediately followed by session bytes.
+	authPayload, _ := json.Marshal(protocol.AuthRequest{AuthToken: "good"})
+	pipelined := []byte("PIPELINED-SESSION-BYTES")
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(protocol.ControlMessage{Type: protocol.AuthRequestType, RawPayload: authPayload}); err != nil {
+		t.Fatal(err)
+	}
+	buf.Write(pipelined)
+	if _, err := c2.Write(buf.Bytes()); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Consume the auth response so authenticate can finish.
+	var resp protocol.ControlMessage
+	if err := json.NewDecoder(c2).Decode(&resp); err != nil {
+		t.Fatalf("decode auth response: %v", err)
+	}
+
+	res := <-resCh
+	if !res.ok {
+		t.Fatal("authenticate returned false for a valid token")
+	}
+	got := make([]byte, len(pipelined))
+	if _, err := io.ReadFull(res.conn, got); err != nil {
+		t.Fatalf("read pipelined bytes from returned conn: %v", err)
+	}
+	if string(got) != string(pipelined) {
+		t.Errorf("got %q, want %q (pipelined bytes must survive, newline must be dropped)", got, pipelined)
 	}
 }
 
@@ -645,6 +706,108 @@ func TestSetupHTTPTunnel_SubdomainCollisionFallsBackToRandom(t *testing.T) {
 	}
 	if len(s.httpTunnels) != 2 {
 		t.Errorf("len(httpTunnels)=%d, want 2 (pre-existing + new)", len(s.httpTunnels))
+	}
+}
+
+func TestSetupHTTPTunnel_RejectsInvalidSubdomain(t *testing.T) {
+	for _, bad := range []string{"evil.victim", "has space", "UPPER_caseOnly_is_ok_but_underscore_not!", "admin"} {
+		s := New(&Config{Domain: "localhost"})
+		sess, _ := newYamuxPair(t)
+		ctrl1, ctrl2 := net.Pipe()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- s.setupHTTPTunnel(protocol.RequestTunnel{Type: "http", Subdomain: bad}, sess, ctrl1)
+		}()
+		resp := readControl(t, ctrl2)
+		if err := <-errCh; err == nil {
+			t.Errorf("subdomain %q: expected an error, got nil", bad)
+		}
+		var tr protocol.TunnelResponse
+		json.Unmarshal(resp.RawPayload, &tr)
+		if tr.Error == "" {
+			t.Errorf("subdomain %q: expected an error TunnelResponse", bad)
+		}
+		if len(s.tunnels) != 0 || len(s.httpTunnels) != 0 {
+			t.Errorf("subdomain %q: no tunnel must be created (tunnels=%d, http=%d)", bad, len(s.tunnels), len(s.httpTunnels))
+		}
+		ctrl1.Close()
+		ctrl2.Close()
+	}
+}
+
+func TestSetupHTTPTunnel_NormalizesUppercaseSubdomain(t *testing.T) {
+	s := New(&Config{Domain: "localhost"})
+	sess, _ := newYamuxPair(t)
+	ctrl1, ctrl2 := net.Pipe()
+	defer ctrl1.Close()
+	defer ctrl2.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.setupHTTPTunnel(protocol.RequestTunnel{Type: "http", Subdomain: "MyApp"}, sess, ctrl1)
+	}()
+	resp := readControl(t, ctrl2)
+	if err := <-errCh; err != nil {
+		t.Fatalf("setupHTTPTunnel: %v", err)
+	}
+	var tr protocol.TunnelResponse
+	json.Unmarshal(resp.RawPayload, &tr)
+	if tr.PublicURL != "http://myapp.localhost" {
+		t.Errorf("PublicURL=%q, want lowercased http://myapp.localhost", tr.PublicURL)
+	}
+	if _, ok := s.httpTunnels["myapp.localhost"]; !ok {
+		t.Error("expected lowercased key myapp.localhost in httpTunnels")
+	}
+}
+
+func TestRemoveHopByHopHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Test", "keep")
+	h.Set("Connection", "X-Secret, Keep-Alive")
+	h.Set("X-Secret", "leak")
+	h.Set("Keep-Alive", "timeout=5")
+	h.Set("Transfer-Encoding", "chunked")
+	h.Set("Upgrade", "h2c")
+
+	removeHopByHopHeaders(h)
+
+	if h.Get("X-Test") != "keep" {
+		t.Error("non-hop-by-hop header X-Test must be preserved")
+	}
+	for _, k := range []string{"Connection", "X-Secret", "Keep-Alive", "Transfer-Encoding", "Upgrade"} {
+		if v := h.Get(k); v != "" {
+			t.Errorf("hop-by-hop header %s must be removed, got %q", k, v)
+		}
+	}
+}
+
+func TestHandleRequestTunnel_EnforcesPerSessionTunnelCap(t *testing.T) {
+	s := New(&Config{Domain: "localhost", MaxTunnelsPerSession: 1})
+	sess, _ := newYamuxPair(t)
+	// Pre-occupy the session's single allowed tunnel slot.
+	s.tunnels["pre"] = &Tunnel{ID: "pre", Session: sess}
+
+	ctrl1, ctrl2 := net.Pipe()
+	defer ctrl1.Close()
+	defer ctrl2.Close()
+
+	payload, _ := json.Marshal(protocol.RequestTunnel{Type: "http", Subdomain: "second"})
+	msg := protocol.ControlMessage{Type: protocol.RequestTunnelType, RawPayload: payload}
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.handleRequestTunnel(&msg, sess, ctrl1) }()
+
+	resp := readControl(t, ctrl2)
+	if err := <-errCh; err == nil {
+		t.Error("expected an error when the per-session tunnel cap is exceeded")
+	}
+	var tr protocol.TunnelResponse
+	json.Unmarshal(resp.RawPayload, &tr)
+	if tr.Error == "" {
+		t.Error("expected an error TunnelResponse when the cap is exceeded")
+	}
+	if _, ok := s.httpTunnels["second.localhost"]; ok {
+		t.Error("no new tunnel must be created when the cap is exceeded")
 	}
 }
 
@@ -900,6 +1063,25 @@ func TestGenerateSelfSignedCert(t *testing.T) {
 	}
 	if _, err := tls.LoadX509KeyPair(certFile, keyFile); err != nil {
 		t.Fatalf("generated cert/key not loadable: %v", err)
+	}
+}
+
+func TestGenerateSelfSignedCert_KeyIsNotWorldReadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file mode bits are not enforced on Windows")
+	}
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "cert.pem")
+	keyFile := filepath.Join(dir, "key.pem")
+	if err := generateSelfSignedCert(certFile, keyFile, "localhost"); err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+	info, err := os.Stat(keyFile)
+	if err != nil {
+		t.Fatalf("stat key file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("key file mode = %#o, want owner-only (no group/other bits, e.g. 0600)", perm)
 	}
 }
 

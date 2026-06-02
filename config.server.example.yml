@@ -30,13 +30,34 @@ keepalive_interval: "30s"
 # Write timeout for the connection (e.g., 10s, 1m)
 connection_write_timeout: "30s"
 
+# --- Resource limits (0 = unlimited / disabled) ---
+
+# Max concurrent tunnels a single authenticated client may create.
+max_tunnels_per_session: 100
+
+# Max concurrent public connections per TCP tunnel.
+max_conns_per_tunnel: 256
+
+# Max concurrent control-channel connections (unauthenticated-flood protection).
+max_control_connections: 512
+
+# Public HTTP server read/write timeouts. Default "0s" = unlimited, which suits large
+# uploads/downloads through the tunnel. Set non-zero (e.g. "60s") to harden against
+# slow-body / slow-read clients when your tunnels only carry small payloads.
+http_read_timeout: "0s"
+http_write_timeout: "0s"
+
+# Max public HTTP request body size in bytes (0 = unlimited).
+max_http_request_bytes: 0
+
 # --- Status Dashboard Configuration ---
 
 # Address for the status dashboard (e.g., ":4040")
 dashboard_addr: ":4040"
 
-# (Optional) Credentials to protect dashboard access with Basic Auth.
-# Remove or leave empty to disable authentication.
+# Credentials for dashboard Basic Auth. BOTH are REQUIRED whenever dashboard_addr is
+# set: if either is empty the dashboard refuses to start and is never served
+# unauthenticated. Use a strong password.
 dashboard_username: "admin"
 dashboard_password: "change-me"
 

@@ -101,7 +101,7 @@ func TestAuthenticate_WriteError(t *testing.T) {
 	c1.Close()
 	c2.Close()
 
-	if err := c.authenticate(c1); err == nil {
+	if _, err := c.authenticate(c1); err == nil {
 		t.Fatal("expected an error sending auth on a closed connection")
 	}
 }
@@ -113,7 +113,7 @@ func TestAuthenticate_DecodeError(t *testing.T) {
 	defer c1.Close()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- c.authenticate(c1) }()
+	go func() { _, err := c.authenticate(c1); errCh <- err }()
 
 	decode(t, c2) // consume the auth request
 	c2.Close()    // close without sending a response
@@ -133,7 +133,7 @@ func TestAuthenticate_MalformedResponsePayload(t *testing.T) {
 	defer c2.Close()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- c.authenticate(c1) }()
+	go func() { _, err := c.authenticate(c1); errCh <- err }()
 
 	decode(t, c2) // consume the auth request
 	// Right type, junk inner payload (a JSON string, not an AuthResponse object).

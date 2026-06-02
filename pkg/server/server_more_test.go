@@ -517,7 +517,7 @@ func TestAuthenticate_MalformedPayloadRejected(t *testing.T) {
 	defer c2.Close()
 
 	res := make(chan bool, 1)
-	go func() { res <- s.authenticate(c1) }()
+	go func() { _, ok := s.authenticate(c1); res <- ok }()
 
 	// RawPayload is a JSON string, not an AuthRequest object -> inner unmarshal fails.
 	if err := json.NewEncoder(c2).Encode(protocol.ControlMessage{Type: protocol.AuthRequestType, RawPayload: []byte(`"not-an-object"`)}); err != nil {

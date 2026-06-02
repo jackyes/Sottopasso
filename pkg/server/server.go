@@ -4,6 +4,7 @@ import (
 	"Sottopasso/pkg/protocol"
 	tunnel_pkg "Sottopasso/pkg/tunnel"
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
@@ -21,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +61,14 @@ type Config struct {
 	DashboardTLSKeyFile    string
 	KeepaliveInterval      time.Duration
 	ConnectionWriteTimeout time.Duration
+
+	// Resource limits (0 = unlimited / disabled).
+	MaxTunnelsPerSession  int           // max concurrent tunnels a single client session may create
+	MaxConnsPerTunnel     int           // max concurrent public connections per TCP tunnel
+	MaxControlConnections int           // max concurrent control-channel connections
+	HTTPReadTimeout       time.Duration // public HTTP server ReadTimeout (0 = unlimited)
+	HTTPWriteTimeout      time.Duration // public HTTP server WriteTimeout (0 = unlimited)
+	MaxHTTPRequestBytes   int64         // max public HTTP request body size in bytes
 }
 
 // Server is the main structure of our tunnel server.
@@ -77,9 +87,13 @@ type Server struct {
 
 // New creates a new server instance.
 func New(config *Config) *Server {
-	// Generate a random CSRF token for dashboard form protection
+	// Generate a random CSRF token for dashboard form protection.
+	// A crypto/rand failure would leave the token all-zero (predictable), which
+	// would silently defeat CSRF protection — so fail hard instead of ignoring it.
 	csrfBytes := make([]byte, 32)
-	rand.Read(csrfBytes)
+	if _, err := rand.Read(csrfBytes); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed while generating CSRF token: %v", err))
+	}
 	csrfToken := fmt.Sprintf("%x", csrfBytes)
 
 	tmpl := template.Must(template.New("dashboard").Funcs(template.FuncMap{
@@ -156,6 +170,12 @@ func (s *Server) startControlListener() error {
 	s.controlListener = ln
 	defer s.controlListener.Close()
 
+	// Bound the number of concurrent control connections so an unauthenticated flood
+	// cannot exhaust goroutines/FDs while connections sit in the auth window.
+	var sem chan struct{}
+	if s.config.MaxControlConnections > 0 {
+		sem = make(chan struct{}, s.config.MaxControlConnections)
+	}
 	for {
 		conn, err := s.controlListener.Accept()
 		if err != nil {
@@ -165,7 +185,21 @@ func (s *Server) startControlListener() error {
 			log.Printf("Error accepting new TLS connection: %v", err)
 			continue
 		}
-		go s.handleClientConnection(conn)
+		if sem != nil {
+			select {
+			case sem <- struct{}{}:
+			default:
+				log.Printf("Control connection limit (%d) reached; rejecting %s", s.config.MaxControlConnections, conn.RemoteAddr())
+				conn.Close()
+				continue
+			}
+		}
+		go func(conn net.Conn) {
+			if sem != nil {
+				defer func() { <-sem }()
+			}
+			s.handleClientConnection(conn)
+		}(conn)
 	}
 	return nil
 }
@@ -173,6 +207,15 @@ func (s *Server) startControlListener() error {
 // startDashboardListener starts the web server for the status page.
 func (s *Server) startDashboardListener() {
 	if s.config.DashboardAddr == "" {
+		return
+	}
+
+	// Fail closed: never expose the dashboard without authentication. The dashboard
+	// reveals the full tunnel inventory (including client IPs) and offers a tunnel-close
+	// action, so requiring both credentials prevents the silent fail-open where a missing
+	// username or password served everything to anyone who could reach the address.
+	if s.config.DashboardUsername == "" || s.config.DashboardPassword == "" {
+		log.Printf("Dashboard NOT started: dashboard_addr is set but dashboard_username and/or dashboard_password are missing. Configure both to enable the dashboard.")
 		return
 	}
 
@@ -188,12 +231,14 @@ func (s *Server) startDashboardListener() {
 
 	useTLS := s.config.DashboardTLSCertFile != "" && s.config.DashboardTLSKeyFile != ""
 	if useTLS {
-		log.Printf("Secure status dashboard available at https://%s", s.config.DashboardAddr)
-		if _, err := s.getTLSConfig(s.config.DashboardTLSCertFile, s.config.DashboardTLSKeyFile, "localhost"); err != nil {
+		cfg, err := s.getTLSConfig(s.config.DashboardTLSCertFile, s.config.DashboardTLSKeyFile, "localhost")
+		if err != nil {
 			log.Printf("Unable to get TLS configuration for dashboard: %v", err)
 			return
 		}
-		if err := s.dashboardServer.ListenAndServeTLS(s.config.DashboardTLSCertFile, s.config.DashboardTLSKeyFile); err != http.ErrServerClosed {
+		s.dashboardServer.TLSConfig = cfg
+		log.Printf("Secure status dashboard available at https://%s", s.config.DashboardAddr)
+		if err := s.dashboardServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
 			log.Printf("Dashboard TLS server error: %v", err)
 		}
 	} else {
@@ -214,12 +259,20 @@ func (s *Server) startHTTPListener() {
 		Addr:              s.config.HTTPAddr,
 		Handler:           s,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       s.config.HTTPReadTimeout,
+		WriteTimeout:      s.config.HTTPWriteTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
 
 	if s.config.HTTPUseTLS {
+		cfg, err := s.getTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile, "localhost")
+		if err != nil {
+			log.Printf("Unable to get TLS configuration for HTTPS listener: %v", err)
+			return
+		}
+		s.httpServer.TLSConfig = cfg
 		log.Printf("HTTPS listener listening on %s", s.config.HTTPAddr)
-		if err := s.httpServer.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile); err != http.ErrServerClosed {
+		if err := s.httpServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
 			log.Printf("Fatal HTTPS listener error: %v", err)
 		}
 	} else {
@@ -233,8 +286,11 @@ func (s *Server) startHTTPListener() {
 // basicAuth is an HTTP Basic authentication middleware.
 func (s *Server) basicAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Fail closed. startDashboardListener refuses to bind when credentials are
+		// empty, so reaching here without them means misconfiguration — deny rather
+		// than serve the dashboard unauthenticated.
 		if s.config.DashboardUsername == "" || s.config.DashboardPassword == "" {
-			next.ServeHTTP(w, r)
+			http.Error(w, "Dashboard authentication is not configured.", http.StatusServiceUnavailable)
 			return
 		}
 		user, pass, ok := r.BasicAuth()
@@ -256,6 +312,18 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		// Constrain what the dashboard page may load. 'unsafe-inline' is required by the
+		// page's inline <style>/<script>; the font origins match the template's links.
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; "+
+				"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
+				"font-src https://fonts.gstatic.com; "+
+				"script-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data:; "+
+				"frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -370,7 +438,9 @@ func generateSelfSignedCert(certFile, keyFile, host string) error {
 	defer crtOut.Close()
 	pem.Encode(crtOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 
-	keyOut, err := os.Create(keyFile)
+	// The private key must be owner-only: os.Create would use 0666 (world-readable
+	// after umask). Open it explicitly with 0600 so other local users cannot read it.
+	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -387,13 +457,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
+	// Host names are case-insensitive; tunnel keys are stored lowercase, so fold the
+	// lookup to match and avoid case-based routing confusion.
+	host = strings.ToLower(host)
 	s.httpTunnelsMu.RLock()
 	t, ok := s.httpTunnels[host]
 	s.httpTunnelsMu.RUnlock()
 
 	if !ok {
+		// Do not reflect the attacker-controlled Host into the body; keep it static
+		// and non-sniffable.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintf(w, "Tunnel for %s not found.", host)
+		io.WriteString(w, "Tunnel not found.\n")
 		return
 	}
 
@@ -459,6 +536,9 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 		return
 	}
 	defer clientConn.Close()
+	// Detach from the http.Server's Read/WriteTimeout: hijacked WebSocket/SSE
+	// connections are long-lived and must not be reaped by those deadlines.
+	clientConn.SetDeadline(time.Time{})
 
 	stream, err := t.Session.OpenStream()
 	if err != nil {
@@ -498,8 +578,34 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 	log.Printf("%s proxy for %s terminated", protocol, host)
 }
 
+// hopByHopHeaders are connection-specific and must not be forwarded to the public
+// client (RFC 7230 6.1). Forwarding them lets a backend desync framing or poison
+// downstream caches.
+var hopByHopHeaders = []string{
+	"Connection", "Proxy-Connection", "Keep-Alive",
+	"Transfer-Encoding", "TE", "Trailer", "Upgrade",
+}
+
+// removeHopByHopHeaders deletes the fixed hop-by-hop set plus any header named in a
+// Connection token from h.
+func removeHopByHopHeaders(h http.Header) {
+	for _, connVal := range h.Values("Connection") {
+		for _, name := range strings.Split(connVal, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				h.Del(name)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+}
+
 func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
+	if s.config.MaxHTTPRequestBytes > 0 && r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxHTTPRequestBytes)
+	}
 	stream, err := t.Session.OpenStream()
 	if err != nil {
 		log.Printf("Unable to open stream for host %s: %v", host, err)
@@ -530,6 +636,13 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		return
 	}
 	defer resp.Body.Close()
+
+	// The backend (the tunnel client's own service) controls the remaining response
+	// headers, including Set-Cookie/CORS/Location for its own public hostname — that is
+	// the intended trust boundary. Still strip hop-by-hop headers so a backend cannot
+	// desync framing (CL.TE/TE.CL) or poison downstream caches via
+	// Connection/Transfer-Encoding/etc.
+	removeHopByHopHeaders(resp.Header)
 
 	// Copy headers from the tunnel response to the original response
 	for key, values := range resp.Header {
@@ -601,7 +714,8 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 	defer conn.Close()
 	log.Printf("New client connected from %s", conn.RemoteAddr())
 
-	if !s.authenticate(conn) {
+	sessionConn, ok := s.authenticate(conn)
+	if !ok {
 		log.Printf("Authentication failed for client %s", conn.RemoteAddr())
 		return
 	}
@@ -611,7 +725,7 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 	yamuxConfig := yamux.DefaultConfig()
 	yamuxConfig.KeepAliveInterval = s.config.KeepaliveInterval
 	yamuxConfig.ConnectionWriteTimeout = s.config.ConnectionWriteTimeout
-	session, err := yamux.Server(conn, yamuxConfig)
+	session, err := yamux.Server(sessionConn, yamuxConfig)
 	if err != nil {
 		log.Printf("Error creating yamux session for %s: %v", conn.RemoteAddr(), err)
 		return
@@ -635,6 +749,19 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 }
 
 // cleanupTunnelsForSession removes all tunnels associated with a client session.
+// countTunnelsForSession returns how many active tunnels belong to a session.
+func (s *Server) countTunnelsForSession(session *yamux.Session) int {
+	s.tunnelsMu.RLock()
+	defer s.tunnelsMu.RUnlock()
+	n := 0
+	for _, t := range s.tunnels {
+		if t.Session == session {
+			n++
+		}
+	}
+	return n
+}
+
 func (s *Server) cleanupTunnelsForSession(session *yamux.Session) {
 	// Lock order: httpTunnelsMu -> tunnelsMu (same as setupHTTPTunnel to avoid deadlock)
 	s.httpTunnelsMu.Lock()
@@ -655,6 +782,28 @@ func (s *Server) cleanupTunnelsForSession(session *yamux.Session) {
 	}
 }
 
+// validSubdomain matches a single DNS label: lowercase alphanumerics and hyphens,
+// not starting or ending with a hyphen, at most 63 characters.
+var validSubdomain = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// reservedSubdomains cannot be claimed by clients (server / infrastructure names).
+var reservedSubdomains = map[string]bool{
+	"www":       true,
+	"admin":     true,
+	"dashboard": true,
+}
+
+// sendTunnelError reports a tunnel-setup failure to the client over the control
+// stream and returns the same message as an error for server-side logging.
+func sendTunnelError(ctrlStream net.Conn, errMsg string) error {
+	payload, _ := json.Marshal(protocol.TunnelResponse{Error: errMsg})
+	respMsg := protocol.ControlMessage{Type: protocol.TunnelResponseType, RawPayload: payload}
+	if err := json.NewEncoder(ctrlStream).Encode(respMsg); err != nil {
+		return fmt.Errorf("%s (and failed to notify client: %w)", errMsg, err)
+	}
+	return fmt.Errorf("%s", errMsg)
+}
+
 func (s *Server) handleRequestTunnel(msg *protocol.ControlMessage, session *yamux.Session, ctrlStream net.Conn) error {
 	var req protocol.RequestTunnel
 	if err := json.Unmarshal(msg.RawPayload, &req); err != nil {
@@ -663,21 +812,19 @@ func (s *Server) handleRequestTunnel(msg *protocol.ControlMessage, session *yamu
 
 	log.Printf("Received request for tunnel type '%s' from %s", req.Type, session.RemoteAddr())
 
+	if s.config.MaxTunnelsPerSession > 0 {
+		if n := s.countTunnelsForSession(session); n >= s.config.MaxTunnelsPerSession {
+			return sendTunnelError(ctrlStream, fmt.Sprintf("tunnel limit reached (%d) for this session", s.config.MaxTunnelsPerSession))
+		}
+	}
+
 	switch req.Type {
 	case "tcp":
 		return s.setupTCPTunnel(req, session, ctrlStream)
 	case "http":
 		return s.setupHTTPTunnel(req, session, ctrlStream)
 	default:
-		errMsg := fmt.Sprintf("unsupported tunnel type: %s", req.Type)
-		resp := protocol.TunnelResponse{Error: errMsg}
-		payload, _ := json.Marshal(resp)
-		respMsg := protocol.ControlMessage{
-			Type:       protocol.TunnelResponseType,
-			RawPayload: payload,
-		}
-		json.NewEncoder(ctrlStream).Encode(respMsg)
-		return fmt.Errorf("%s", errMsg)
+		return sendTunnelError(ctrlStream, fmt.Sprintf("unsupported tunnel type: %s", req.Type))
 	}
 }
 
@@ -688,6 +835,19 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	domain := s.config.Domain
 	if h, _, err := net.SplitHostPort(domain); err == nil {
 		domain = h
+	}
+	domain = strings.ToLower(domain)
+
+	// Validate a client-requested subdomain: it must be a single lowercase DNS label.
+	// Reject (rather than silently ignore) malformed input so a client cannot inject
+	// dots/uppercase/whitespace into the host key, shadow other labels, or desync the
+	// case-insensitive Host lookup. Empty means "assign a random one".
+	if req.Subdomain != "" {
+		normalized := strings.ToLower(req.Subdomain)
+		if !validSubdomain.MatchString(normalized) || reservedSubdomains[normalized] {
+			return sendTunnelError(ctrlStream, fmt.Sprintf("invalid or reserved subdomain: %q", req.Subdomain))
+		}
+		req.Subdomain = normalized
 	}
 
 	s.httpTunnelsMu.Lock()
@@ -787,6 +947,12 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 			listener.Close()
 		}()
 
+		// Bound concurrent public connections per tunnel so a public flood cannot
+		// exhaust goroutines/streams on the server and the target client.
+		var sem chan struct{}
+		if s.config.MaxConnsPerTunnel > 0 {
+			sem = make(chan struct{}, s.config.MaxConnsPerTunnel)
+		}
 		for {
 			publicConn, err := listener.Accept()
 			if err != nil {
@@ -794,8 +960,21 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 				return
 			}
 
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+				default:
+					log.Printf("TCP tunnel %s: per-tunnel connection limit (%d) reached; rejecting %s", publicAddr, s.config.MaxConnsPerTunnel, publicConn.RemoteAddr())
+					publicConn.Close()
+					continue
+				}
+			}
+
 			go func(publicConn net.Conn) {
 				defer publicConn.Close()
+				if sem != nil {
+					defer func() { <-sem }()
+				}
 				log.Printf("Accepted public connection from %s, forwarding to client %s", publicConn.RemoteAddr(), session.RemoteAddr())
 
 				stream, err := session.OpenStream()
@@ -819,26 +998,29 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 }
 
 // authenticate handles the authentication flow.
-func (s *Server) authenticate(conn net.Conn) bool {
+func (s *Server) authenticate(conn net.Conn) (net.Conn, bool) {
 	// Set a deadline to prevent clients from holding connections open without authenticating
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer conn.SetReadDeadline(time.Time{}) // Clear deadline after auth
 
+	// Keep the decoder so any bytes it buffers past the auth message can be handed to
+	// yamux instead of being dropped (a peer may pipeline the first session bytes).
+	dec := json.NewDecoder(io.LimitReader(conn, maxControlMessageSize))
 	var msg protocol.ControlMessage
-	if err := json.NewDecoder(io.LimitReader(conn, maxControlMessageSize)).Decode(&msg); err != nil {
+	if err := dec.Decode(&msg); err != nil {
 		log.Printf("Error decoding auth message: %v", err)
-		return false
+		return conn, false
 	}
 
 	if msg.Type != protocol.AuthRequestType {
 		log.Printf("First message is not AuthRequest type, but %s", msg.Type)
-		return false
+		return conn, false
 	}
 
 	var authReq protocol.AuthRequest
 	if err := json.Unmarshal(msg.RawPayload, &authReq); err != nil {
 		log.Printf("Error unmarshaling AuthRequest payload: %v", err)
-		return false
+		return conn, false
 	}
 
 	valid := false
@@ -863,10 +1045,17 @@ func (s *Server) authenticate(conn net.Conn) bool {
 
 	if err := json.NewEncoder(conn).Encode(respMsg); err != nil {
 		log.Printf("Error sending auth response: %v", err)
-		return false
+		return conn, false
 	}
 
-	return valid
+	// dec.Buffered() holds the JSON-lines delimiter (a trailing newline) plus any bytes
+	// the peer pipelined after it. Trim the inter-message whitespace; whatever remains is
+	// genuine session data (yamux frames never start with ASCII whitespace).
+	buffered, _ := io.ReadAll(dec.Buffered())
+	if buffered = bytes.TrimLeft(buffered, " \t\r\n"); len(buffered) > 0 {
+		return &prefixConn{Conn: conn, prefix: buffered}, valid
+	}
+	return conn, valid
 }
 
 const dashboardTemplate = `

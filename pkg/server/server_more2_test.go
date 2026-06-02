@@ -147,11 +147,28 @@ func TestStartDashboardListener_HTTPServesWithBasicAuth(t *testing.T) {
 	}
 }
 
+func TestStartDashboardListener_RefusesWithoutCredentials(t *testing.T) {
+	addr := freeAddrs(t, 1)[0]
+	s := New(&Config{DashboardAddr: addr, DashboardUsername: "admin"}) // password missing
+	done := make(chan struct{})
+	go func() { s.startDashboardListener(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("startDashboardListener must return immediately when credentials are incomplete")
+	}
+	if s.dashboardServer != nil {
+		t.Error("dashboard server must not be created when credentials are incomplete")
+	}
+}
+
 func TestStartDashboardListener_TLSServesDashboard(t *testing.T) {
 	addr := freeAddrs(t, 1)[0]
 	dir := t.TempDir()
 	s := New(&Config{
 		DashboardAddr:        addr,
+		DashboardUsername:    "admin",
+		DashboardPassword:    "pw",
 		DashboardTLSCertFile: filepath.Join(dir, "d.cert.pem"),
 		DashboardTLSKeyFile:  filepath.Join(dir, "d.key.pem"),
 	})
@@ -164,12 +181,14 @@ func TestStartDashboardListener_TLSServesDashboard(t *testing.T) {
 	waitDial(t, addr, 3*time.Second)
 
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	resp, err := client.Get("https://" + addr + "/")
+	req, _ := http.NewRequest("GET", "https://"+addr+"/", nil)
+	req.SetBasicAuth("admin", "pw")
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("HTTPS GET on dashboard: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("code=%d, want 200 (no basic auth configured)", resp.StatusCode)
+		t.Errorf("code=%d, want 200 (TLS dashboard with basic auth)", resp.StatusCode)
 	}
 }
