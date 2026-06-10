@@ -2,33 +2,36 @@ package tunnel
 
 import (
 	"io"
+	"sync"
 )
 
 // Proxy handles bidirectional data copying between two measured connections.
+//
+// When one direction reaches EOF, only the write side of its destination is
+// closed (half-close) so data still in flight in the opposite direction is not
+// truncated — e.g. a peer that shuts down its write side after sending a
+// request must still receive the full response. Both connections are fully
+// closed once both directions have finished.
 func Proxy(a, b *MeasuredConn) {
-	done := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	go func() {
-		if _, err := io.Copy(a, b); err != nil {
+	copyDirection := func(dst, src *MeasuredConn) {
+		defer wg.Done()
+		if _, err := io.Copy(dst, src); err != nil {
 			if err != io.EOF {
-				// log.Printf("Error copying from B to A: %v", err)
+				// log.Printf("Error copying: %v", err)
 			}
 		}
-		a.Close()
-		b.Close()
-		done <- struct{}{}
-	}()
+		// Propagate EOF to the destination's peer without tearing down the
+		// reverse direction.
+		dst.CloseWrite()
+	}
 
-	go func() {
-		if _, err := io.Copy(b, a); err != nil {
-			if err != io.EOF {
-				// log.Printf("Error copying from A to B: %v", err)
-			}
-		}
-		a.Close()
-		b.Close()
-		done <- struct{}{}
-	}()
+	go copyDirection(a, b)
+	go copyDirection(b, a)
 
-	<-done
+	wg.Wait()
+	a.Close()
+	b.Close()
 }

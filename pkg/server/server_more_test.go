@@ -119,7 +119,8 @@ func TestHandleHTTPRequest_OpenStreamFailureReturns5xx(t *testing.T) {
 }
 
 // If the tunnel client closes its stream without producing a response, the proxy
-// must give up without panicking or writing a bogus body.
+// must answer 502: returning without a status would make net/http send an implicit
+// empty 200, and a dead backend would look healthy to the visitor.
 func TestHandleHTTPRequest_ClientClosesWithoutResponding(t *testing.T) {
 	s := New(&Config{Domain: "localhost"})
 	serverSess, clientSess := newYamuxPair(t)
@@ -142,8 +143,8 @@ func TestHandleHTTPRequest_ClientClosesWithoutResponding(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("handleHTTPRequest hung when the client closed without responding")
 	}
-	if rec.Body.Len() != 0 {
-		t.Errorf("expected no body to be written, got %q", rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("code=%d, want 502 when the tunnel client produces no response", rec.Code)
 	}
 }
 
@@ -442,8 +443,11 @@ func TestServeDashboard_POSTDispatchesToCloseTunnel(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Errorf("code=%d, want 302 (POST should dispatch to handleCloseTunnel)", rec.Code)
 	}
-	if !sess.IsClosed() {
-		t.Error("expected the tunnel session to be closed via the POST path")
+	s.tunnelsMu.RLock()
+	_, stillThere := s.tunnels["abc"]
+	s.tunnelsMu.RUnlock()
+	if stillThere {
+		t.Error("expected the tunnel to be deregistered via the POST path")
 	}
 }
 

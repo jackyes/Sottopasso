@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -998,7 +999,11 @@ func TestHandleCloseTunnel_CSRFAndValidation(t *testing.T) {
 func TestHandleCloseTunnel_Success(t *testing.T) {
 	s := New(&Config{})
 	sess, _ := newYamuxPair(t)
-	tun := &Tunnel{ID: "abc", Type: "tcp", Session: sess}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := &Tunnel{ID: "abc", Type: "tcp", Session: sess, listener: ln}
 	s.tunnels["abc"] = tun
 
 	rec := httptest.NewRecorder()
@@ -1006,9 +1011,20 @@ func TestHandleCloseTunnel_Success(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Fatalf("code=%d, want 302 redirect", rec.Code)
 	}
-	// Session should have been closed.
-	if !sess.IsClosed() {
-		t.Error("expected the tunnel session to be closed")
+	// The tunnel must be deregistered and its public listener closed...
+	s.tunnelsMu.RLock()
+	_, stillThere := s.tunnels["abc"]
+	s.tunnelsMu.RUnlock()
+	if stillThere {
+		t.Error("expected the tunnel to be removed from s.tunnels")
+	}
+	if _, err := ln.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("expected the public listener to be closed, Accept returned %v", err)
+	}
+	// ...but the client's session must survive: other tunnels multiplexed on it
+	// keep working.
+	if sess.IsClosed() {
+		t.Error("closing one tunnel must not close the whole client session")
 	}
 }
 

@@ -47,6 +47,11 @@ max_control_connections: 512
 http_read_timeout: "0s"
 http_write_timeout: "0s"
 
+# Max time for the tunnel client to deliver the response headers of a proxied HTTP
+# request. The response body is exempt and may stream without limit. Protects the
+# server from stalled backends pinning goroutines/streams forever. "0s" = unlimited.
+http_response_header_timeout: "30s"
+
 # Max public HTTP request body size in bytes (0 = unlimited).
 max_http_request_bytes: 0
 

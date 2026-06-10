@@ -54,6 +54,12 @@ func main() {
 			log.Fatal("Both protocol and port must be provided as positional arguments, or use flags. Use --help for usage.")
 		}
 	} else if len(args) >= 2 && *tunnelType == "" && *localPort == 0 {
+		// Reject trailing arguments instead of dropping them: the flag package stops
+		// parsing at the first positional argument, so flags placed after
+		// "[protocol] [port]" would otherwise be silently ignored.
+		if len(args) > 2 {
+			log.Fatalf("Unexpected arguments after [protocol] [port]: %v. Flags must come before positional arguments.", args[2:])
+		}
 		// If protocol and port are provided as positional arguments and no flags were set, use them
 		*tunnelType = args[0]
 		port, err := strconv.Atoi(args[1])
@@ -124,11 +130,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid keepalive_interval format: %v", err)
 	}
+	// yamux rejects a non-positive keepalive at session creation, which would
+	// surface only after a successful authentication — catch it here instead.
+	if keepalive <= 0 {
+		log.Fatalf("keepalive_interval must be positive, got %q", configYAML.KeepaliveInterval)
+	}
 
 	// Parse connection write timeout
 	writeTimeout, err := time.ParseDuration(configYAML.ConnectionWriteTimeout)
 	if err != nil {
 		log.Fatalf("Invalid connection_write_timeout format: %v", err)
+	}
+	if writeTimeout <= 0 {
+		log.Fatalf("connection_write_timeout must be positive, got %q", configYAML.ConnectionWriteTimeout)
 	}
 
 	dialTimeout, err := time.ParseDuration(configYAML.DialTimeout)
@@ -152,6 +166,10 @@ func main() {
 
 	if config.TunnelType != "http" && config.TunnelType != "tcp" {
 		log.Fatalf("Invalid tunnel protocol %q: must be \"http\" or \"tcp\".", config.TunnelType)
+	}
+
+	if config.LocalPort < 1 || config.LocalPort > 65535 {
+		log.Fatalf("Invalid local port %d: must be in the range 1-65535.", config.LocalPort)
 	}
 
 	if config.AuthToken == "" {

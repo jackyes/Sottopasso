@@ -38,3 +38,20 @@ func (c *MeasuredConn) Write(p []byte) (n int, err error) {
 	}
 	return
 }
+
+// closeWriter is implemented by connections that support half-close
+// (e.g. *net.TCPConn, *tls.Conn).
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// CloseWrite half-closes the write side of the underlying connection when
+// supported, falling back to a full Close. The fallback is still correct for
+// yamux streams, whose Close only forbids further local writes while reads
+// keep draining buffered data.
+func (c *MeasuredConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}

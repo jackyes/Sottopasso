@@ -95,7 +95,12 @@ func (c *Client) Start() error {
 		return fmt.Errorf("unable to open control stream: %w", err)
 	}
 
-	publicURL, err := c.requestTunnel(ctrlStream)
+	// One decoder for the control stream's lifetime: a throwaway decoder per
+	// response would discard bytes it buffered past the current message, losing
+	// pipelined responses (the same bug once fixed on the server side).
+	ctrlDec := json.NewDecoder(io.LimitReader(ctrlStream, 1<<20))
+
+	publicURL, err := c.requestTunnel(ctrlStream, ctrlDec)
 	if err != nil {
 		return fmt.Errorf("tunnel request failed: %w", err)
 	}
@@ -124,7 +129,8 @@ func (c *Client) Start() error {
 }
 
 // requestTunnel sends a tunnel creation request and waits for the response.
-func (c *Client) requestTunnel(ctrlStream net.Conn) (string, error) {
+// dec must be the control stream's long-lived decoder, shared across requests.
+func (c *Client) requestTunnel(ctrlStream net.Conn, dec *json.Decoder) (string, error) {
 	req := protocol.RequestTunnel{
 		Type:      c.config.TunnelType,
 		LocalPort: c.config.LocalPort,
@@ -141,7 +147,7 @@ func (c *Client) requestTunnel(ctrlStream net.Conn) (string, error) {
 	}
 
 	var respMsg protocol.ControlMessage
-	if err := json.NewDecoder(io.LimitReader(ctrlStream, 1<<20)).Decode(&respMsg); err != nil {
+	if err := dec.Decode(&respMsg); err != nil {
 		return "", fmt.Errorf("unable to decode tunnel response: %w", err)
 	}
 

@@ -43,6 +43,10 @@ type Tunnel struct {
 	TotalBytesIn  atomic.Uint64  `json:"total_bytes_in"`
 	TotalBytesOut atomic.Uint64  `json:"total_bytes_out"`
 	Session       *yamux.Session `json:"-"`
+
+	// listener is the public listener of a TCP tunnel (nil for HTTP tunnels).
+	// Set before the tunnel is published in the maps, never mutated afterwards.
+	listener net.Listener
 }
 
 // Config contains the server configuration.
@@ -69,6 +73,12 @@ type Config struct {
 	HTTPReadTimeout       time.Duration // public HTTP server ReadTimeout (0 = unlimited)
 	HTTPWriteTimeout      time.Duration // public HTTP server WriteTimeout (0 = unlimited)
 	MaxHTTPRequestBytes   int64         // max public HTTP request body size in bytes
+
+	// HTTPResponseHeaderTimeout bounds the round-trip with the tunnel client for a
+	// proxied HTTP request: relaying the request plus reading the response headers.
+	// It does not apply to the response body, which may stream indefinitely.
+	// (0 = unlimited)
+	HTTPResponseHeaderTimeout time.Duration
 }
 
 // Server is the main structure of our tunnel server.
@@ -78,6 +88,9 @@ type Server struct {
 	tunnelsMu         sync.RWMutex
 	httpTunnels       map[string]*Tunnel
 	httpTunnelsMu     sync.RWMutex
+	// serversMu guards httpServer, dashboardServer and controlListener: they are
+	// assigned by listener goroutines while Shutdown may read them concurrently.
+	serversMu         sync.Mutex
 	httpServer        *http.Server
 	dashboardServer   *http.Server
 	controlListener   net.Listener
@@ -144,14 +157,34 @@ func (s *Server) Start() error {
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown() {
 	log.Println("Shutting down servers...")
-	if s.controlListener != nil {
-		s.controlListener.Close()
+	s.serversMu.Lock()
+	controlListener := s.controlListener
+	httpServer := s.httpServer
+	dashboardServer := s.dashboardServer
+	s.serversMu.Unlock()
+	if controlListener != nil {
+		controlListener.Close()
 	}
-	if s.httpServer != nil {
-		s.httpServer.Close()
+	if httpServer != nil {
+		httpServer.Close()
 	}
-	if s.dashboardServer != nil {
-		s.dashboardServer.Close()
+	if dashboardServer != nil {
+		dashboardServer.Close()
+	}
+
+	// Close every client session: per-tunnel TCP listeners and their accept
+	// goroutines only exit when their session dies, so without this a library
+	// caller would leak them all.
+	s.tunnelsMu.RLock()
+	sessions := make(map[*yamux.Session]struct{})
+	for _, t := range s.tunnels {
+		if t.Session != nil {
+			sessions[t.Session] = struct{}{}
+		}
+	}
+	s.tunnelsMu.RUnlock()
+	for session := range sessions {
+		session.Close()
 	}
 }
 
@@ -167,8 +200,10 @@ func (s *Server) startControlListener() error {
 	if err != nil {
 		return fmt.Errorf("unable to start control TLS listener: %w", err)
 	}
+	s.serversMu.Lock()
 	s.controlListener = ln
-	defer s.controlListener.Close()
+	s.serversMu.Unlock()
+	defer ln.Close()
 
 	// Bound the number of concurrent control connections so an unauthenticated flood
 	// cannot exhaust goroutines/FDs while connections sit in the auth window.
@@ -177,12 +212,15 @@ func (s *Server) startControlListener() error {
 		sem = make(chan struct{}, s.config.MaxControlConnections)
 	}
 	for {
-		conn, err := s.controlListener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
-			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+			if errors.Is(err, net.ErrClosed) {
 				break
 			}
 			log.Printf("Error accepting new TLS connection: %v", err)
+			// Back off briefly: persistent accept errors (e.g. FD exhaustion)
+			// would otherwise spin this loop at full speed.
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		if sem != nil {
@@ -221,13 +259,16 @@ func (s *Server) startDashboardListener() {
 
 	handler := http.HandlerFunc(s.serveDashboard)
 	authHandler := s.securityHeaders(s.basicAuth(handler))
-	s.dashboardServer = &http.Server{
+	srv := &http.Server{
 		Addr:         s.config.DashboardAddr,
 		Handler:      authHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+	s.serversMu.Lock()
+	s.dashboardServer = srv
+	s.serversMu.Unlock()
 
 	useTLS := s.config.DashboardTLSCertFile != "" && s.config.DashboardTLSKeyFile != ""
 	if useTLS {
@@ -236,14 +277,14 @@ func (s *Server) startDashboardListener() {
 			log.Printf("Unable to get TLS configuration for dashboard: %v", err)
 			return
 		}
-		s.dashboardServer.TLSConfig = cfg
+		srv.TLSConfig = cfg
 		log.Printf("Secure status dashboard available at https://%s", s.config.DashboardAddr)
-		if err := s.dashboardServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+		if err := srv.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
 			log.Printf("Dashboard TLS server error: %v", err)
 		}
 	} else {
 		log.Printf("Status dashboard available at http://%s", s.config.DashboardAddr)
-		if err := s.dashboardServer.ListenAndServe(); err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Printf("Dashboard server error: %v", err)
 		}
 	}
@@ -255,14 +296,22 @@ func (s *Server) startHTTPListener() {
 		return
 	}
 
-	s.httpServer = &http.Server{
+	srv := &http.Server{
 		Addr:              s.config.HTTPAddr,
 		Handler:           s,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       s.config.HTTPReadTimeout,
 		WriteTimeout:      s.config.HTTPWriteTimeout,
 		IdleTimeout:       120 * time.Second,
+		// Disable HTTP/2: the WebSocket/SSE paths rely on http.Hijacker, which
+		// the h2 ResponseWriter does not implement — h2 clients would get 500s
+		// on every SSE request. A non-nil empty map suppresses the automatic
+		// h2 configuration of ListenAndServeTLS.
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
+	s.serversMu.Lock()
+	s.httpServer = srv
+	s.serversMu.Unlock()
 
 	if s.config.HTTPUseTLS {
 		cfg, err := s.getTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile, "localhost")
@@ -270,14 +319,14 @@ func (s *Server) startHTTPListener() {
 			log.Printf("Unable to get TLS configuration for HTTPS listener: %v", err)
 			return
 		}
-		s.httpServer.TLSConfig = cfg
+		srv.TLSConfig = cfg
 		log.Printf("HTTPS listener listening on %s", s.config.HTTPAddr)
-		if err := s.httpServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+		if err := srv.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
 			log.Printf("Fatal HTTPS listener error: %v", err)
 		}
 	} else {
 		log.Printf("HTTP listener listening on %s", s.config.HTTPAddr)
-		if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Printf("Fatal HTTP listener error: %v", err)
 		}
 	}
@@ -335,13 +384,17 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Snapshot under the lock, render after releasing it: the template writes to
+	// the client's socket and can block on a slow reader, and holding tunnelsMu
+	// here would stall tunnel cleanup — and through it (httpTunnelsMu) the whole
+	// public routing path. Tunnel fields are immutable after publication except
+	// the atomic counters, so rendering without the lock is safe.
 	s.tunnelsMu.RLock()
-	defer s.tunnelsMu.RUnlock()
-
 	tunnels := make([]*Tunnel, 0, len(s.tunnels))
 	for _, t := range s.tunnels {
 		tunnels = append(tunnels, t)
 	}
+	s.tunnelsMu.RUnlock()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := s.dashboardTemplate.Execute(w, tunnels); err != nil {
@@ -373,9 +426,31 @@ func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Closing tunnel %s on dashboard request", tunnelID)
-	tunnel.Session.Close()
+	s.closeTunnel(tunnel)
 
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// closeTunnel tears down a single tunnel without killing the owning client's
+// session: other tunnels multiplexed on the same session keep working. HTTP
+// tunnels are deregistered from the host map; TCP tunnels also close their
+// public listener (in-flight connections are left to drain on their own).
+func (s *Server) closeTunnel(t *Tunnel) {
+	// Lock order: httpTunnelsMu -> tunnelsMu (same as setupHTTPTunnel/cleanup)
+	s.httpTunnelsMu.Lock()
+	s.tunnelsMu.Lock()
+	if t.Type == "http" {
+		host := strings.TrimPrefix(t.PublicURL, "http://")
+		host = strings.TrimPrefix(host, "https://")
+		delete(s.httpTunnels, host)
+	}
+	delete(s.tunnels, t.ID)
+	s.tunnelsMu.Unlock()
+	s.httpTunnelsMu.Unlock()
+
+	if t.listener != nil {
+		t.listener.Close()
+	}
 }
 
 // getTLSConfig loads or generates a TLS configuration.
@@ -489,7 +564,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func isWebSocketRequest(r *http.Request) bool {
-	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
+	// The method check matters beyond RFC 6455 pedantry: the hijack path has no
+	// body-size limit or deadlines, so without it any POST carrying Upgrade
+	// headers would bypass MaxHTTPRequestBytes and the HTTP timeouts entirely.
+	return r.Method == http.MethodGet &&
+		strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
@@ -511,6 +590,15 @@ func (c *prefixConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	return c.Conn.Read(p)
+}
+
+// CloseWrite forwards a half-close to the underlying connection when supported
+// (the embedded net.Conn interface would otherwise hide it from the proxy).
+func (c *prefixConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
 }
 
 // handleHijackedRequest manages protocols (WebSocket, SSE) that require
@@ -614,28 +702,61 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	}
 	defer stream.Close()
 
+	// Bound the round-trip with the tunnel client (request relay + response
+	// headers) so a stalled backend cannot pin this handler goroutine and its
+	// yamux stream forever. The deadline is cleared before the body copy:
+	// response bodies may legitimately stream for a long time.
+	if d := s.config.HTTPResponseHeaderTimeout; d > 0 {
+		stream.SetDeadline(time.Now().Add(d))
+	}
+
 	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
+
+	// net/http answers the visitor's "Expect: 100-continue" itself (it sends the
+	// interim 100 when the body is first read), so the header must not be relayed:
+	// the backend's own "100 Continue" would be mistaken for the final response.
+	r.Header.Del("Expect")
 
 	// Write the HTTP request to the tunnel stream
 	if err := r.Write(mStream); err != nil {
 		log.Printf("Error writing request to stream: %v", err)
+		// Request.Write wraps body-read errors in an unexported type with no
+		// Unwrap method, so errors.As alone cannot see the MaxBytesError from
+		// MaxBytesReader — fall back to its (stable) message.
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) || strings.Contains(err.Error(), "http: request body too large") {
+			http.Error(w, "Request body too large.", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "Bad gateway.", http.StatusBadGateway)
+		}
 		return
 	}
 
-	// Read the HTTP response from the tunnel stream
-	resp, err := http.ReadResponse(bufio.NewReader(mStream), r)
+	// Read the HTTP response from the tunnel stream. Interim 1xx responses
+	// (e.g. 103 Early Hints) are skipped: unlike http.Transport, ReadResponse
+	// returns them as if they were final. 101 is excluded — after "Switching
+	// Protocols" the stream no longer carries HTTP. The iteration cap keeps a
+	// misbehaving backend from spinning this loop.
+	br := bufio.NewReader(mStream)
+	resp, err := http.ReadResponse(br, r)
+	for i := 0; err == nil && resp.StatusCode >= 100 && resp.StatusCode < 200 &&
+		resp.StatusCode != http.StatusSwitchingProtocols && i < 5; i++ {
+		resp.Body.Close()
+		resp, err = http.ReadResponse(br, r)
+	}
 	if err != nil {
-		// If there is an error reading the response, it could be because the client
-		// closed the connection. In this case, do not send an HTTP response.
+		// Nothing has been written to w yet, so a clean 502 is safe. Returning
+		// without a status would make net/http send an implicit empty 200, and a
+		// dead backend would look healthy to the visitor.
 		if err != io.EOF && err != io.ErrUnexpectedEOF {
 			log.Printf("Error reading response from stream: %v", err)
 		}
-		// We cannot send a header here because the connection may be in an indeterminate state.
-		// Try sending a BadGateway, but it may fail.
-		// w.WriteHeader(http.StatusBadGateway)
+		http.Error(w, "Bad gateway: the tunnel client did not return a response.", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	stream.SetDeadline(time.Time{})
 
 	// The backend (the tunnel client's own service) controls the remaining response
 	// headers, including Set-Cookie/CORS/Location for its own public hostname — that is
@@ -651,9 +772,24 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		}
 	}
 
+	// Announce trailers (parsed by ReadResponse into resp.Trailer) so their
+	// values can be written after the body — e.g. gRPC-Web status, checksums.
+	if len(resp.Trailer) > 0 {
+		names := make([]string, 0, len(resp.Trailer))
+		for name := range resp.Trailer {
+			names = append(names, name)
+		}
+		w.Header().Set("Trailer", strings.Join(names, ", "))
+	}
+
 	// Write the status code and the response body
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+	for name, values := range resp.Trailer {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
 }
 
 // maxControlMessageSize bounds the bytes a single control message may occupy on the wire.
@@ -921,6 +1057,7 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 		Status:     "active",
 		CreatedAt:  time.Now(),
 		Session:    session,
+		listener:   listener,
 	}
 
 	s.tunnelsMu.Lock()
@@ -936,6 +1073,11 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 		RawPayload: payload,
 	}
 	if err := json.NewEncoder(ctrlStream).Encode(respMsg); err != nil {
+		// Deregister the tunnel: leaving it published would show a ghost entry
+		// (with a dead listener) until the whole session is cleaned up.
+		s.tunnelsMu.Lock()
+		delete(s.tunnels, tunnel.ID)
+		s.tunnelsMu.Unlock()
 		listener.Close()
 		return fmt.Errorf("error sending TunnelResponse: %w", err)
 	}

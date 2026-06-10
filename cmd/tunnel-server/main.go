@@ -35,6 +35,10 @@ type ConfigYAML struct {
 	HTTPReadTimeout        string   `yaml:"http_read_timeout"`
 	HTTPWriteTimeout       string   `yaml:"http_write_timeout"`
 	MaxHTTPRequestBytes    int64    `yaml:"max_http_request_bytes"`
+
+	// Max time for the tunnel client to deliver the response headers of a proxied
+	// HTTP request (the body may then stream without limit). "0s" = unlimited.
+	HTTPResponseHeaderTimeout string `yaml:"http_response_header_timeout"`
 }
 
 func main() {
@@ -58,6 +62,7 @@ func main() {
 	configYAML.MaxControlConnections = 512
 	configYAML.HTTPReadTimeout = "0s"
 	configYAML.HTTPWriteTimeout = "0s"
+	configYAML.HTTPResponseHeaderTimeout = "30s"
 	if err := yaml.Unmarshal(yamlFile, &configYAML); err != nil {
 		log.Fatalf("Error parsing YAML file: %v", err)
 	}
@@ -81,10 +86,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid keepalive_interval format: %v", err)
 	}
+	// yamux rejects a non-positive keepalive at session creation, which would
+	// surface as every client failing right after authentication — catch it here.
+	if keepalive <= 0 {
+		log.Fatalf("keepalive_interval must be positive, got %q", configYAML.KeepaliveInterval)
+	}
 
 	writeTimeout, err := time.ParseDuration(configYAML.ConnectionWriteTimeout)
 	if err != nil {
 		log.Fatalf("Invalid connection_write_timeout format: %v", err)
+	}
+	if writeTimeout <= 0 {
+		log.Fatalf("connection_write_timeout must be positive, got %q", configYAML.ConnectionWriteTimeout)
 	}
 
 	httpReadTimeout, err := time.ParseDuration(configYAML.HTTPReadTimeout)
@@ -95,6 +108,11 @@ func main() {
 	httpWriteTimeout, err := time.ParseDuration(configYAML.HTTPWriteTimeout)
 	if err != nil {
 		log.Fatalf("Invalid http_write_timeout format: %v", err)
+	}
+
+	httpResponseHeaderTimeout, err := time.ParseDuration(configYAML.HTTPResponseHeaderTimeout)
+	if err != nil {
+		log.Fatalf("Invalid http_response_header_timeout format: %v", err)
 	}
 
 	config := &server.Config{
@@ -118,6 +136,8 @@ func main() {
 		HTTPReadTimeout:        httpReadTimeout,
 		HTTPWriteTimeout:       httpWriteTimeout,
 		MaxHTTPRequestBytes:    configYAML.MaxHTTPRequestBytes,
+
+		HTTPResponseHeaderTimeout: httpResponseHeaderTimeout,
 	}
 
 	srv := server.New(config)

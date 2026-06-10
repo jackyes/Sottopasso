@@ -154,7 +154,7 @@ func TestRequestTunnel_WriteError(t *testing.T) {
 	c1.Close()
 	c2.Close()
 
-	if _, err := c.requestTunnel(c1); err == nil {
+	if _, err := c.requestTunnel(c1, json.NewDecoder(c1)); err == nil {
 		t.Fatal("expected an error sending the tunnel request on a closed connection")
 	}
 }
