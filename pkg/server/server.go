@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,8 +134,37 @@ func New(config *Config) *Server {
 		"duration": func(d time.Time) string {
 			return time.Since(d).Round(time.Second).String()
 		},
+		"uptimeSeconds": func(d time.Time) int64 {
+			return int64(time.Since(d) / time.Second)
+		},
 		"csrfToken": func() string {
 			return csrfToken
+		},
+		"countType": func(ts []*Tunnel, typ string) int {
+			n := 0
+			for _, t := range ts {
+				if t.Type == typ {
+					n++
+				}
+			}
+			return n
+		},
+		"totalIn": func(ts []*Tunnel) uint64 {
+			var n uint64
+			for _, t := range ts {
+				n += t.TotalBytesIn.Load()
+			}
+			return n
+		},
+		"totalOut": func(ts []*Tunnel) uint64 {
+			var n uint64
+			for _, t := range ts {
+				n += t.TotalBytesOut.Load()
+			}
+			return n
+		},
+		"isHTTPURL": func(u string) bool {
+			return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
 		},
 	}).Parse(dashboardTemplate))
 
@@ -257,8 +287,10 @@ func (s *Server) startDashboardListener() {
 		return
 	}
 
-	handler := http.HandlerFunc(s.serveDashboard)
-	authHandler := s.securityHeaders(s.basicAuth(handler))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/tunnels", s.serveTunnelsJSON)
+	mux.HandleFunc("/", s.serveDashboard)
+	authHandler := s.securityHeaders(s.basicAuth(mux))
 	srv := &http.Server{
 		Addr:         s.config.DashboardAddr,
 		Handler:      authHandler,
@@ -362,12 +394,13 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		// Constrain what the dashboard page may load. 'unsafe-inline' is required by the
-		// page's inline <style>/<script>; the font origins match the template's links.
+		// page's inline <style>/<script>; everything else is same-origin (the page is
+		// fully self-contained — system fonts, inline SVG favicon, fetch to /api/tunnels).
 		w.Header().Set("Content-Security-Policy",
 			"default-src 'self'; "+
-				"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "+
-				"font-src https://fonts.gstatic.com; "+
+				"style-src 'self' 'unsafe-inline'; "+
 				"script-src 'self' 'unsafe-inline'; "+
+				"connect-src 'self'; "+
 				"img-src 'self' data:; "+
 				"frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
 		if r.TLS != nil {
@@ -389,6 +422,18 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	// here would stall tunnel cleanup — and through it (httpTunnelsMu) the whole
 	// public routing path. Tunnel fields are immutable after publication except
 	// the atomic counters, so rendering without the lock is safe.
+	tunnels := s.snapshotTunnels()
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.dashboardTemplate.Execute(w, tunnels); err != nil {
+		log.Printf("Error executing dashboard template: %v", err)
+	}
+}
+
+// snapshotTunnels returns the current tunnels in a stable order (oldest first,
+// ID as tie-break) so the dashboard and the JSON feed do not reshuffle rows on
+// every refresh the way map iteration would.
+func (s *Server) snapshotTunnels() []*Tunnel {
 	s.tunnelsMu.RLock()
 	tunnels := make([]*Tunnel, 0, len(s.tunnels))
 	for _, t := range s.tunnels {
@@ -396,9 +441,60 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	s.tunnelsMu.RUnlock()
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.dashboardTemplate.Execute(w, tunnels); err != nil {
-		log.Printf("Error executing dashboard template: %v", err)
+	sort.Slice(tunnels, func(i, j int) bool {
+		if !tunnels[i].CreatedAt.Equal(tunnels[j].CreatedAt) {
+			return tunnels[i].CreatedAt.Before(tunnels[j].CreatedAt)
+		}
+		return tunnels[i].ID < tunnels[j].ID
+	})
+	return tunnels
+}
+
+// tunnelView is the JSON shape served to the dashboard's polling script.
+// Tunnel itself cannot be marshaled usefully (atomic counters have no exported
+// fields), and a dedicated DTO keeps the wire format independent of internals.
+type tunnelView struct {
+	ID            string    `json:"id"`
+	Type          string    `json:"type"`
+	PublicURL     string    `json:"public_url"`
+	ClientAddr    string    `json:"client_addr"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
+	UptimeSeconds int64     `json:"uptime_seconds"`
+	BytesIn       uint64    `json:"bytes_in"`
+	BytesOut      uint64    `json:"bytes_out"`
+}
+
+// serveTunnelsJSON feeds the dashboard's auto-refresh with the live tunnel list.
+// It sits behind the same Basic Auth and security headers as the HTML page.
+func (s *Server) serveTunnelsJSON(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	tunnels := s.snapshotTunnels()
+	now := time.Now()
+	views := make([]tunnelView, 0, len(tunnels))
+	for _, t := range tunnels {
+		views = append(views, tunnelView{
+			ID:            t.ID,
+			Type:          t.Type,
+			PublicURL:     t.PublicURL,
+			ClientAddr:    t.ClientAddr,
+			Status:        t.Status,
+			CreatedAt:     t.CreatedAt,
+			UptimeSeconds: int64(now.Sub(t.CreatedAt) / time.Second),
+			BytesIn:       t.TotalBytesIn.Load(),
+			BytesOut:      t.TotalBytesOut.Load(),
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := json.NewEncoder(w).Encode(map[string]any{"tunnels": views}); err != nil {
+		log.Printf("Error encoding tunnels JSON: %v", err)
 	}
 }
 
@@ -1199,309 +1295,3 @@ func (s *Server) authenticate(conn net.Conn) (net.Conn, bool) {
 	}
 	return conn, valid
 }
-
-const dashboardTemplate = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sottopasso - Dashboard</title>
-    <meta http-equiv="refresh" content="5">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-color: #1a1a1a;
-            --text-color: #e0e0e0;
-            --header-color: #c0c0c0;
-            --border-color: #333;
-            --table-header-bg: #2c2c2c;
-            --table-row-odd-bg: #252525;
-            --accent-color: #007bff;
-            --status-active: #28a745;
-        }
-        body.light-mode {
-            --bg-color: #f5f5f5;
-            --text-color: #333;
-            --header-color: #555;
-            --border-color: #ddd;
-            --table-header-bg: #e9ecef;
-            --table-row-odd-bg: #f8f9fa;
-        }
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-color);
-            margin: 0;
-            padding: 2rem;
-            transition: background-color 0.3s, color 0.3s;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-        }
-        .header-left {
-            display: flex;
-            align-items: center;
-        }
-        .logo {
-            width: 40px;
-            height: 40px;
-            margin-right: 1rem;
-        }
-        h1 {
-            font-size: 2rem;
-            font-weight: 600;
-            color: var(--header-color);
-        }
-        .theme-switch-wrapper {
-            display: flex;
-            align-items: center;
-        }
-        .theme-switch {
-            display: inline-block;
-            height: 34px;
-            position: relative;
-            width: 60px;
-        }
-        .theme-switch input {
-            display:none;
-        }
-        .slider {
-            background-color: #ccc;
-            bottom: 0;
-            cursor: pointer;
-            left: 0;
-            position: absolute;
-            right: 0;
-            top: 0;
-            transition: .4s;
-        }
-        .slider:before {
-            background-color: #fff;
-            bottom: 4px;
-            content: "";
-            height: 26px;
-            left: 4px;
-            position: absolute;
-            transition: .4s;
-            width: 26px;
-        }
-        input:checked + .slider {
-            background-color: var(--accent-color);
-        }
-        input:checked + .slider:before {
-            transform: translateX(26px);
-        }
-        .slider.round {
-            border-radius: 34px;
-        }
-        .slider.round:before {
-            border-radius: 50%;
-        }
-        .summary {
-            margin-bottom: 2rem;
-            font-size: 1.1rem;
-        }
-        .summary span {
-            font-weight: 600;
-            color: var(--accent-color);
-        }
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            border-radius: 8px;
-            overflow: hidden;
-        }
-        th, td {
-            padding: 1rem;
-            text-align: left;
-            border-bottom: 1px solid var(--border-color);
-        }
-        th {
-            background-color: var(--table-header-bg);
-            font-weight: 600;
-            text-transform: uppercase;
-            font-size: 0.8rem;
-            letter-spacing: 0.05em;
-        }
-        tr:nth-child(odd) {
-            background-color: var(--table-row-odd-bg);
-        }
-        .status-active {
-            color: var(--status-active);
-            font-weight: 600;
-        }
-        .url {
-            word-break: break-all;
-        }
-        .action-button {
-            background-color: #dc3545;
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 0.9rem;
-        }
-        .action-button:hover {
-            background-color: #c82333;
-        }
-        @media (max-width: 768px) {
-            body { padding: 1rem; }
-            .header { flex-direction: column; align-items: flex-start; }
-            .theme-switch-wrapper { margin-top: 1rem; }
-            h1 { font-size: 1.8rem; }
-            table, thead, tbody, th, td, tr {
-                display: block;
-            }
-            thead tr {
-                position: absolute;
-                top: -9999px;
-                left: -9999px;
-            }
-            tr {
-                border: 1px solid var(--border-color);
-                margin-bottom: 1rem;
-                border-radius: 8px;
-                background-color: var(--table-row-odd-bg);
-            }
-            td {
-                border: none;
-                border-bottom: 1px solid var(--border-color);
-                position: relative;
-                padding-left: 50%;
-                padding-top: 0.75rem;
-                padding-bottom: 0.75rem;
-                display: flex;
-                align-items: center;
-            }
-            tr:last-child td:last-child {
-                border-bottom: none;
-            }
-            td:before {
-                position: absolute;
-                top: 50%;
-                transform: translateY(-50%);
-                left: 1rem;
-                width: 40%;
-                padding-right: 1rem;
-                white-space: nowrap;
-                font-weight: 600;
-                text-transform: uppercase;
-                font-size: 0.75rem;
-                color: var(--header-color);
-            }
-            td:nth-of-type(1):before { content: "ID"; }
-            td:nth-of-type(2):before { content: "Type"; }
-            td:nth-of-type(3):before { content: "Public URL"; }
-            td:nth-of-type(4):before { content: "Client"; }
-            td:nth-of-type(5):before { content: "Status"; }
-            td:nth-of-type(6):before { content: "Created"; }
-            td:nth-of-type(7):before { content: "Uptime"; }
-            td:nth-of-type(8):before { content: "Traffic (In / Out)"; }
-            td:nth-of-type(9):before { content: "Action"; }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div class="header-left">
-                <svg class="logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-                    <defs>
-                        <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                            <stop offset="0%" style="stop-color:var(--accent-color);stop-opacity:1" />
-                            <stop offset="100%" style="stop-color:var(--status-active);stop-opacity:1" />
-                        </linearGradient>
-                    </defs>
-                    <path d="M10 50 Q 20 20, 50 30 T 90 50 M10 50 Q 20 80, 50 70 T 90 50" fill="none" stroke="url(#logoGradient)" stroke-width="10" stroke-linecap="round"/>
-                </svg>
-                <h1>Sottopasso</h1>
-            </div>
-            <div class="theme-switch-wrapper">
-                <label class="theme-switch" for="checkbox">
-                    <input type="checkbox" id="checkbox" />
-                    <div class="slider round"></div>
-                </label>
-            </div>
-        </div>
-
-        <div class="summary">
-            <p>Active tunnels: <span>{{ len . }}</span></p>
-        </div>
-
-        <table>
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Type</th>
-                    <th>Public URL</th>
-                    <th>Client</th>
-                    <th>Status</th>
-                    <th>Created</th>
-                    <th>Uptime</th>
-                    <th>Traffic (In / Out)</th>
-                    <th>Action</th>
-                </tr>
-            </thead>
-            <tbody>
-                {{range .}}
-                <tr>
-                    <td>{{ .ID }}</td>
-                    <td>{{ .Type }}</td>
-                    <td class="url">{{ .PublicURL }}</td>
-                    <td>{{ .ClientAddr }}</td>
-                    <td class="status-{{ .Status }}">{{ .Status }}</td>
-                    <td>{{ .CreatedAt.Format "2006-01-02 15:04:05" }}</td>
-                    <td>{{ duration .CreatedAt }}</td>
-                    <td>{{ formatBytes .TotalBytesIn.Load }} / {{ formatBytes .TotalBytesOut.Load }}</td>
-                    <td>
-                        <form method="POST" style="margin:0;">
-                            <input type="hidden" name="csrf_token" value="{{ csrfToken }}">
-                            <input type="hidden" name="tunnelId" value="{{ .ID }}">
-                            <button type="submit" class="action-button">Close</button>
-                        </form>
-                    </td>
-                </tr>
-                {{end}}
-            </tbody>
-        </table>
-    </div>
-    <script>
-        const toggleSwitch = document.querySelector('.theme-switch input[type="checkbox"]');
-        const currentTheme = localStorage.getItem('theme');
-
-        if (currentTheme) {
-            document.body.classList.add(currentTheme);
-        
-            if (currentTheme === 'light-mode') {
-                toggleSwitch.checked = true;
-            }
-        }
-
-        function switchTheme(e) {
-            if (e.target.checked) {
-                document.body.classList.add('light-mode');
-                localStorage.setItem('theme', 'light-mode');
-            }
-            else {
-                document.body.classList.remove('light-mode');
-                localStorage.setItem('theme', 'dark-mode');
-            }
-        }
-
-        toggleSwitch.addEventListener('change', switchTheme, false);
-    </script>
-</body>
-</html>
-`

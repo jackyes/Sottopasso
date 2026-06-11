@@ -1057,8 +1057,8 @@ func TestServeDashboard_RendersAndFormatsBytes(t *testing.T) {
 			t.Errorf("dashboard body missing formatted value %q", want)
 		}
 	}
-	// Active tunnel count is rendered.
-	if !strings.Contains(body, "<span>6</span>") {
+	// Active tunnel count is rendered in the stats card.
+	if !strings.Contains(body, `id="stat-active">6<`) {
 		t.Error("expected active tunnel count of 6 in dashboard")
 	}
 	// CSRF token should be embedded in the close forms.
