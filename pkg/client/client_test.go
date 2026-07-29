@@ -2,6 +2,7 @@ package client
 
 import (
 	"Sottopasso/pkg/protocol"
+	"context"
 	"encoding/json"
 	"net"
 	"strings"
@@ -186,7 +187,7 @@ func TestHandleServerStream_LocalServiceUnreachable(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.handleServerStream(client) // closes client when done
+		c.handleServerStream(context.Background(), client) // closes client when done
 		close(done)
 	}()
 

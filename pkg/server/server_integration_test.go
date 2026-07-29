@@ -2,6 +2,7 @@ package server
 
 import (
 	"Sottopasso/pkg/client"
+	"context"
 	"crypto/tls"
 	"io"
 	"net"
@@ -105,8 +106,12 @@ func TestEndToEnd_HTTPTunnel(t *testing.T) {
 		KeepaliveInterval:      30 * time.Second,
 		ConnectionWriteTimeout: 10 * time.Second,
 	})
+	// Start now retries until its context is cancelled, so the test owns the
+	// client's lifetime.
+	clientCtx, stopClient := context.WithCancel(context.Background())
+	defer stopClient()
 	clientErr := make(chan error, 1)
-	go func() { clientErr <- cli.Start() }()
+	go func() { clientErr <- cli.Start(clientCtx) }()
 
 	// The tunnel registers asynchronously after the client authenticates and
 	// requests it; poll the public endpoint until it resolves to the backend.

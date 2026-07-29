@@ -4,18 +4,37 @@ import (
 	"Sottopasso/pkg/protocol"
 	"Sottopasso/pkg/tunnel"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
+	"net/url"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/yamux"
 )
+
+// Reconnect defaults, applied when the corresponding Config field is unset.
+const (
+	defaultReconnectMinBackoff = 1 * time.Second
+	defaultReconnectMaxBackoff = 60 * time.Second
+)
+
+// FatalError marks a failure that reconnecting cannot fix, so Start gives up
+// instead of retrying. Every other error is treated as transient.
+type FatalError struct{ Err error }
+
+func (e *FatalError) Error() string { return e.Err.Error() }
+func (e *FatalError) Unwrap() error { return e.Err }
 
 // Config contains the configuration for the client.
 type Config struct {
@@ -29,6 +48,9 @@ type Config struct {
 	ConnectionWriteTimeout time.Duration // Write timeout for yamux connection
 	MaxConcurrentStreams   int           // Max concurrent server-opened streams handled at once (0 = unlimited)
 	DialTimeout            time.Duration // Timeout dialing the local service (0 = no timeout)
+	ConnectTimeout         time.Duration // Timeout dialing the control server (0 = OS default)
+	ReconnectMinBackoff    time.Duration // First reconnect delay (0 = 1s)
+	ReconnectMaxBackoff    time.Duration // Reconnect delay ceiling (0 = 60s)
 }
 
 // Client is the main structure of our tunnel client.
@@ -59,13 +81,105 @@ func (c *prefixConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
-// Start connects to the server, authenticates, and manages the tunnel.
-func (c *Client) Start() error {
-	log.Printf("Connecting to TLS control server at %s...", c.config.ServerAddr)
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: c.config.InsecureSkipVerify,
+// nextBackoff doubles cur, clamped to max.
+func nextBackoff(cur, max time.Duration) time.Duration {
+	if cur <= 0 {
+		return max
 	}
-	conn, err := tls.Dial("tcp", c.config.ServerAddr, tlsConfig)
+	next := cur * 2
+	if next > max || next < cur { // the second test catches duration overflow
+		return max
+	}
+	return next
+}
+
+// jitter spreads d over [d/2, d] so clients that dropped together do not all
+// come back at the same instant.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	half := d / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+// subdomainOf returns the leading DNS label of a public URL's host, lowercased.
+// setupHTTPTunnel builds HTTP public URLs as "<scheme>://<subdomain>.<domain>",
+// so the first label is the subdomain the server actually granted. Returns ""
+// when the URL cannot be parsed or carries no host.
+func subdomainOf(publicURL string) string {
+	u, err := url.Parse(publicURL)
+	if err != nil {
+		return ""
+	}
+	host := u.Hostname()
+	if host == "" {
+		return ""
+	}
+	label, _, _ := strings.Cut(host, ".")
+	return strings.ToLower(label)
+}
+
+// Start keeps a tunnel up for as long as ctx lives, reconnecting with an
+// exponential backoff whenever the session drops. It returns nil once ctx is
+// cancelled, and a *FatalError when retrying cannot help (a rejected token).
+func (c *Client) Start(ctx context.Context) error {
+	minBackoff := c.config.ReconnectMinBackoff
+	if minBackoff <= 0 {
+		minBackoff = defaultReconnectMinBackoff
+	}
+	maxBackoff := c.config.ReconnectMaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = defaultReconnectMaxBackoff
+	}
+	if maxBackoff < minBackoff {
+		maxBackoff = minBackoff
+	}
+
+	delay := minBackoff
+	attempt := 0
+	for {
+		// onEstablished runs synchronously inside runSession, so mutating the
+		// loop state from it needs no extra synchronization. Resetting on a
+		// working session means a tunnel that has been up for hours retries
+		// immediately instead of starting at the ceiling.
+		err := c.runSession(ctx, func() {
+			delay = minBackoff
+			attempt = 0
+		})
+		if ctx.Err() != nil {
+			return nil // shutdown requested, not a failure
+		}
+		var fatal *FatalError
+		if errors.As(err, &fatal) {
+			return err
+		}
+
+		// Counted here rather than at the top of the loop so that the reset
+		// above, which lands mid-iteration, still makes this read as 1.
+		attempt++
+		log.Printf("Connection lost: %v", err)
+		wait := jitter(delay)
+		log.Printf("Reconnecting in %s (attempt %d)...", wait.Round(time.Millisecond), attempt)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+		delay = nextBackoff(delay, maxBackoff)
+	}
+}
+
+// runSession performs one connection attempt: dial, authenticate, request the
+// tunnel, then serve streams until the session dies. onEstablished, when
+// non-nil, is called once the tunnel is confirmed up.
+func (c *Client) runSession(ctx context.Context, onEstablished func()) error {
+	log.Printf("Connecting to TLS control server at %s...", c.config.ServerAddr)
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: c.config.ConnectTimeout},
+		Config:    &tls.Config{InsecureSkipVerify: c.config.InsecureSkipVerify},
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", c.config.ServerAddr)
 	if err != nil {
 		return fmt.Errorf("unable to connect to TLS server: %w", err)
 	}
@@ -90,6 +204,17 @@ func (c *Client) Start() error {
 	}
 	defer session.Close()
 
+	// Closing the session is what unblocks a parked AcceptStream, so a cancelled
+	// ctx must reach it through this watcher rather than the deferred Close
+	// below (which only runs once AcceptStream has already returned). yamux's
+	// Close is idempotent, so the two racing is harmless.
+	sessCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
+	go func() {
+		<-sessCtx.Done()
+		session.Close()
+	}()
+
 	ctrlStream, err := session.OpenStream()
 	if err != nil {
 		return fmt.Errorf("unable to open control stream: %w", err)
@@ -104,8 +229,32 @@ func (c *Client) Start() error {
 	if err != nil {
 		return fmt.Errorf("tunnel request failed: %w", err)
 	}
+
+	// The server falls back to a random subdomain, without reporting an error,
+	// when the requested one is still registered. After a dropped connection
+	// that holder is usually this client's own previous session, which the
+	// server only releases once it notices the old socket died. Drop the
+	// session and retry so the public URL stays the one the user published.
+	if want := strings.ToLower(c.config.Subdomain); want != "" && c.config.TunnelType == "http" {
+		if got := subdomainOf(publicURL); got != want {
+			log.Printf("WARNING: server granted subdomain %q instead of the requested %q. A previous session may still hold it, or another client owns it.", got, want)
+			return fmt.Errorf("subdomain %q not granted (got %q)", want, got)
+		}
+	}
+
 	log.Printf("Public tunnel available at: %s", publicURL)
 	log.Printf("Forwarding to: localhost:%d", c.config.LocalPort)
+	if onEstablished != nil {
+		onEstablished()
+	}
+
+	// Relays parked reading from a silent local service only unwind once
+	// handleServerStream's watcher closes them, so cancel before waiting.
+	// Deferred calls run last-registered-first, putting cancelSession ahead of
+	// wg.Wait.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer cancelSession()
 
 	var sem chan struct{}
 	if c.config.MaxConcurrentStreams > 0 {
@@ -117,13 +266,22 @@ func (c *Client) Start() error {
 			return fmt.Errorf("session terminated: %w", err)
 		}
 		if sem != nil {
-			sem <- struct{}{} // backpressure: stop accepting once at capacity
+			select {
+			case sem <- struct{}{}: // backpressure: stop accepting once at capacity
+			case <-sessCtx.Done():
+				// At capacity when the session died: waiting for a slot would
+				// park here instead of returning to the reconnect loop.
+				stream.Close()
+				return fmt.Errorf("session terminated: %w", sessCtx.Err())
+			}
 		}
+		wg.Add(1)
 		go func(stream net.Conn) {
+			defer wg.Done()
 			if sem != nil {
 				defer func() { <-sem }()
 			}
-			c.handleServerStream(stream)
+			c.handleServerStream(sessCtx, stream)
 		}(stream)
 	}
 }
@@ -168,7 +326,8 @@ func (c *Client) requestTunnel(ctrlStream net.Conn, dec *json.Decoder) (string, 
 }
 
 // handleServerStream handles a new stream opened by the server (a new public connection).
-func (c *Client) handleServerStream(stream net.Conn) {
+// ctx is the session's context: its cancellation tears the relay down.
+func (c *Client) handleServerStream(ctx context.Context, stream net.Conn) {
 	defer stream.Close()
 	connID := uuid.New().String()[:8]
 	log.Printf("[%s] New connection from server, forwarding to localhost:%d.", connID, c.config.LocalPort)
@@ -186,6 +345,21 @@ func (c *Client) handleServerStream(stream net.Conn) {
 		return
 	}
 	defer localConn.Close()
+
+	// Proxy parks in a read until one side sends or closes, and the half-close
+	// it does on the other direction will not wake that read. Force both ends
+	// shut when the session dies, otherwise a local service holding an idle
+	// connection open would keep this relay (and the reconnect) waiting.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			stream.Close()
+			localConn.Close()
+		case <-done:
+		}
+	}()
 
 	// Account traffic once, on the server-facing stream. localConn relays the same
 	// bytes, so measuring it too would double the reported figures.
@@ -230,7 +404,8 @@ func (c *Client) authenticate(conn net.Conn) (net.Conn, error) {
 	}
 
 	if !authResp.Success {
-		return conn, fmt.Errorf("server rejected authentication: %s", authResp.Error)
+		// The token is wrong: reconnecting would only hammer the server.
+		return conn, &FatalError{Err: fmt.Errorf("server rejected authentication: %s", authResp.Error)}
 	}
 
 	// dec.Buffered() holds the JSON-lines delimiter (a trailing newline) plus any bytes

@@ -2,6 +2,7 @@ package client
 
 import (
 	"Sottopasso/pkg/protocol"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -10,9 +11,10 @@ import (
 	"time"
 )
 
-// Start must fail fast with a connection error when the control server is down,
-// rather than blocking or panicking.
-func TestStart_DialFailure(t *testing.T) {
+// A single session attempt must fail fast with a connection error when the
+// control server is down, rather than blocking or panicking. (Start itself
+// retries forever; the per-attempt behaviour is what matters here.)
+func TestRunSession_DialFailure(t *testing.T) {
 	// Reserve then release a port so nothing is listening on it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -30,7 +32,7 @@ func TestStart_DialFailure(t *testing.T) {
 	})
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- c.Start() }()
+	go func() { errCh <- c.runSession(context.Background(), nil) }()
 	select {
 	case err := <-errCh:
 		if err == nil {
@@ -40,7 +42,7 @@ func TestStart_DialFailure(t *testing.T) {
 			t.Errorf("error=%v, want it to mention the connection failure", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("Start did not return on dial failure")
+		t.Fatal("runSession did not return on dial failure")
 	}
 }
 
@@ -71,7 +73,7 @@ func TestHandleServerStream_ProxiesToLocalService(t *testing.T) {
 	streamSide, publicSide := net.Pipe()
 
 	done := make(chan struct{})
-	go func() { c.handleServerStream(streamSide); close(done) }()
+	go func() { c.handleServerStream(context.Background(), streamSide); close(done) }()
 
 	publicSide.SetDeadline(time.Now().Add(3 * time.Second))
 	if _, err := publicSide.Write([]byte("ping")); err != nil {

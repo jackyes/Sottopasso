@@ -16,6 +16,7 @@ The application consists of two components:
 - **Flexible Configuration**: Complete management via YAML files, with the possibility of override via command-line flags.
 - **Automatic Certificate Generation**: The server automatically generates self-signed TLS certificates on first startup to simplify development and deployment.
 - **Robust Management**: Automatic cleanup of tunnels on client disconnection and graceful shutdown of both components.
+- **Automatic Reconnection**: The client rides out network failures on its own, reconnecting with an exponential backoff and reclaiming its subdomain so the public URL stays put.
 
 ## Compilation
 
@@ -98,6 +99,38 @@ auth_token: "secret-token-1"
 # REQUIRED for development with self-signed certificates.
 insecure_skip_verify: true
 ```
+
+See `config.client.example.yml` for the full set of keys, including the timeout
+and reconnection settings described below.
+
+#### Reconnection
+
+A TCP connection killed by the network — a NAT mapping expiring, a route flap, a
+server that stops answering — is torn down without a FIN or an RST, so neither
+side hears about it. The client only notices when a `yamux` keepalive ping goes
+unanswered, which takes roughly `keepalive_interval + connection_write_timeout`;
+until then the failing socket surfaces nothing but a read timeout from the OS.
+
+When the session does drop, the client reconnects on its own: it waits
+`reconnect_min_backoff`, doubles the delay after each failed attempt up to
+`reconnect_max_backoff`, and keeps retrying indefinitely. Every wait is jittered
+over `[d/2, d]`, and the delay resets as soon as a tunnel is up again, so a
+long-lived tunnel that drops retries immediately instead of at the ceiling.
+`Ctrl-C` interrupts the wait rather than running it out.
+
+Two behaviours are worth knowing about:
+
+- **A rejected auth token is fatal.** Retrying cannot fix a wrong token, so the
+  client logs the rejection and exits with a non-zero status. Every other
+  failure is treated as transient.
+- **The requested subdomain is reclaimed, not replaced.** The server releases a
+  subdomain only once it notices the old session died, and in the meantime it
+  quietly hands out a random one instead. Rather than serve from a URL nobody
+  was told about, the client drops such a session and retries until it gets its
+  subdomain back. If the subdomain is permanently unavailable — a typo, a
+  reserved label, or another client holding it — this retries forever at the
+  backoff ceiling; the warning logged on each attempt quotes the subdomain that
+  was granted instead.
 
 ## Usage
 

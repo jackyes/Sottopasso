@@ -2,6 +2,7 @@ package main
 
 import (
 	"Sottopasso/pkg/client"
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -25,6 +26,9 @@ type ConfigYAML struct {
 	ConnectionWriteTimeout string `yaml:"connection_write_timeout"`
 	MaxConcurrentStreams   int    `yaml:"max_concurrent_streams"`
 	DialTimeout            string `yaml:"dial_timeout"`
+	ConnectTimeout         string `yaml:"connect_timeout"`
+	ReconnectMinBackoff    string `yaml:"reconnect_min_backoff"`
+	ReconnectMaxBackoff    string `yaml:"reconnect_max_backoff"`
 }
 
 func main() {
@@ -38,6 +42,9 @@ func main() {
 	subdomain := flag.String("subdomain", "", "Requested subdomain (overrides config)")
 	keepaliveInterval := flag.String("keepalive-interval", "", "Keepalive interval (e.g., 30s, 1m). Overrides config.")
 	connectionWriteTimeout := flag.String("connection-write-timeout", "", "Connection write timeout (e.g., 10s, 1m). Overrides config.")
+	connectTimeout := flag.String("connect-timeout", "", "Timeout dialing the control server (e.g., 10s). Overrides config.")
+	reconnectMinBackoff := flag.String("reconnect-min-backoff", "", "First reconnect delay (e.g., 1s). Overrides config.")
+	reconnectMaxBackoff := flag.String("reconnect-max-backoff", "", "Reconnect delay ceiling (e.g., 60s). Overrides config.")
 	flag.Parse()
 
 	// Handle positional arguments: tunnel-client [protocol] [port]
@@ -81,6 +88,9 @@ func main() {
 		ConnectionWriteTimeout: "10s",  // Default value
 		MaxConcurrentStreams:   256,    // Default value
 		DialTimeout:            "10s",  // Default value
+		ConnectTimeout:         "10s",  // Default value
+		ReconnectMinBackoff:    "1s",   // Default value
+		ReconnectMaxBackoff:    "60s",  // Default value
 	}
 	yamlFile, err := os.ReadFile(*configPath)
 	if err == nil {
@@ -112,6 +122,15 @@ func main() {
 	}
 	if *connectionWriteTimeout != "" {
 		configYAML.ConnectionWriteTimeout = *connectionWriteTimeout
+	}
+	if *connectTimeout != "" {
+		configYAML.ConnectTimeout = *connectTimeout
+	}
+	if *reconnectMinBackoff != "" {
+		configYAML.ReconnectMinBackoff = *reconnectMinBackoff
+	}
+	if *reconnectMaxBackoff != "" {
+		configYAML.ReconnectMaxBackoff = *reconnectMaxBackoff
 	}
 
 	// Special handling for the boolean 'insecure' flag
@@ -150,6 +169,31 @@ func main() {
 		log.Fatalf("Invalid dial_timeout format: %v", err)
 	}
 
+	connTimeout, err := time.ParseDuration(configYAML.ConnectTimeout)
+	if err != nil {
+		log.Fatalf("Invalid connect_timeout format: %v", err)
+	}
+	if connTimeout < 0 {
+		log.Fatalf("connect_timeout must not be negative, got %q", configYAML.ConnectTimeout)
+	}
+
+	minBackoff, err := time.ParseDuration(configYAML.ReconnectMinBackoff)
+	if err != nil {
+		log.Fatalf("Invalid reconnect_min_backoff format: %v", err)
+	}
+	if minBackoff <= 0 {
+		log.Fatalf("reconnect_min_backoff must be positive, got %q", configYAML.ReconnectMinBackoff)
+	}
+
+	maxBackoff, err := time.ParseDuration(configYAML.ReconnectMaxBackoff)
+	if err != nil {
+		log.Fatalf("Invalid reconnect_max_backoff format: %v", err)
+	}
+	if maxBackoff < minBackoff {
+		log.Fatalf("reconnect_max_backoff (%q) must be greater than or equal to reconnect_min_backoff (%q).",
+			configYAML.ReconnectMaxBackoff, configYAML.ReconnectMinBackoff)
+	}
+
 	// Create final configuration for the client
 	config := &client.Config{
 		ServerAddr:             configYAML.ServerAddr,
@@ -162,6 +206,9 @@ func main() {
 		ConnectionWriteTimeout: writeTimeout,
 		MaxConcurrentStreams:   configYAML.MaxConcurrentStreams,
 		DialTimeout:            dialTimeout,
+		ConnectTimeout:         connTimeout,
+		ReconnectMinBackoff:    minBackoff,
+		ReconnectMaxBackoff:    maxBackoff,
 	}
 
 	if config.TunnelType != "http" && config.TunnelType != "tcp" {
@@ -178,25 +225,21 @@ func main() {
 
 	cli := client.New(config)
 
-	// Channel to listen for system signals
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	// Start reconnects on its own until this context is cancelled, so a signal
+	// is the only thing that ends a healthy client.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	// Start the client in a goroutine
-	go func() {
-		log.Printf("Starting Tunnel Client to expose local port %d via %s", config.LocalPort, config.TunnelType)
-		if err := cli.Start(); err != nil {
-			log.Printf("Client error: %v", err)
-		}
-		// If Start() terminates (e.g., due to disconnection), send a signal to terminate main
-		quit <- syscall.SIGTERM
-	}()
+	log.Printf("Starting Tunnel Client to expose local port %d via %s", config.LocalPort, config.TunnelType)
+	err = cli.Start(ctx)
+	stop()
 
-	// Wait for a signal (or for the client to terminate on its own)
-	<-quit
+	if err != nil {
+		log.Printf("Client error: %v", err)
+		log.Println("Client stopped.")
+		os.Exit(1)
+	}
+
 	log.Println("Closing client...")
-
-	// Here we could call a cli.Shutdown() method if it were necessary
-	// to close other resources cleanly. For now, exiting is sufficient.
 	log.Println("Client stopped.")
 }

@@ -23,10 +23,32 @@ local_port: 8080
 subdomain: ""
 
 # Keepalive interval for the connection (e.g., 30s, 1m, 1h)
+#
+# A connection killed by the network (NAT timeout, route flap, unreachable
+# server) sends no FIN or RST, so it is only detected once a keepalive ping goes
+# unanswered. That takes roughly keepalive_interval + connection_write_timeout —
+# with the values below, about a minute before the client starts reconnecting.
+# Lower both to shorten the outage; raise them to cut idle chatter.
 keepalive_interval: "30s"
 
-# Write timeout for the connection (e.g., 10s, 1m)
+# Write timeout for the connection (e.g., 10s, 1m). Also bounds how long a
+# keepalive ping waits for its reply.
 connection_write_timeout: "30s"
+
+# Timeout dialing the control server (e.g., 10s). Without it, a server that
+# drops packets keeps every reconnect attempt parked for the OS connect timeout
+# (~21s on Windows).
+connect_timeout: "10s"
+
+# Reconnect backoff. When the session drops, the client waits reconnect_min_backoff,
+# then doubles the delay after every failed attempt up to reconnect_max_backoff,
+# retrying indefinitely until it gets back through or is stopped. Each wait is
+# jittered over [d/2, d]. The delay resets as soon as a tunnel is up again.
+#
+# Reconnecting is not attempted when the server rejects the auth token: that
+# cannot be fixed by retrying, so the client exits.
+reconnect_min_backoff: "1s"
+reconnect_max_backoff: "60s"
 
 # Max concurrent server-pushed streams handled at once (backpressure; 0 = unlimited)
 max_concurrent_streams: 256
