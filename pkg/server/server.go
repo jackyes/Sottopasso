@@ -75,6 +75,15 @@ type Config struct {
 	HTTPWriteTimeout      time.Duration // public HTTP server WriteTimeout (0 = unlimited)
 	MaxHTTPRequestBytes   int64         // max public HTTP request body size in bytes
 
+	// Per-source-address control-channel limits. MaxControlConnections alone is a
+	// global budget, so without these a single peer can hold every slot — a
+	// control connection keeps its slot for the whole session, and an
+	// unauthenticated one keeps it for the full authentication deadline.
+	// IPv6 addresses are grouped by /64.
+	MaxControlConnsPerIP   int           // max concurrent control connections per source (0 = unlimited)
+	ControlAttemptBurst    int           // control connection attempts a source may make back-to-back (0 = no rate limit)
+	ControlAttemptInterval time.Duration // one attempt is restored every interval (0 = no rate limit)
+
 	// HTTPResponseHeaderTimeout bounds the round-trip with the tunnel client for a
 	// proxied HTTP request: relaying the request plus reading the response headers.
 	// It does not apply to the response body, which may stream indefinitely.
@@ -84,11 +93,11 @@ type Config struct {
 
 // Server is the main structure of our tunnel server.
 type Server struct {
-	config            *Config
-	tunnels           map[string]*Tunnel
-	tunnelsMu         sync.RWMutex
-	httpTunnels       map[string]*Tunnel
-	httpTunnelsMu     sync.RWMutex
+	config        *Config
+	tunnels       map[string]*Tunnel
+	tunnelsMu     sync.RWMutex
+	httpTunnels   map[string]*Tunnel
+	httpTunnelsMu sync.RWMutex
 	// serversMu guards httpServer, dashboardServer and controlListener: they are
 	// assigned by listener goroutines while Shutdown may read them concurrently.
 	serversMu         sync.Mutex
@@ -97,6 +106,9 @@ type Server struct {
 	controlListener   net.Listener
 	dashboardTemplate *template.Template
 	csrfToken         string
+	// controlLimiter bounds control connections per source address; nil when both
+	// per-IP limits are disabled.
+	controlLimiter *ipLimiter
 }
 
 // New creates a new server instance.
@@ -174,6 +186,11 @@ func New(config *Config) *Server {
 		httpTunnels:       make(map[string]*Tunnel),
 		dashboardTemplate: tmpl,
 		csrfToken:         csrfToken,
+		controlLimiter: newIPLimiter(
+			config.MaxControlConnsPerIP,
+			config.ControlAttemptBurst,
+			config.ControlAttemptInterval,
+		),
 	}
 }
 
@@ -241,6 +258,27 @@ func (s *Server) startControlListener() error {
 	if s.config.MaxControlConnections > 0 {
 		sem = make(chan struct{}, s.config.MaxControlConnections)
 	}
+	// A flood is rejected as fast as it can connect, so logging every rejection
+	// would put a stderr write (serialized on log's own mutex) in the accept path
+	// and bury everything else in the log. Report the first one immediately, then
+	// at most one line per second with a count of what it stands for.
+	var lastRejectLog time.Time
+	var suppressedRejects int
+	logReject := func(addr net.Addr, reason string) {
+		suppressedRejects++
+		now := time.Now()
+		if !lastRejectLog.IsZero() && now.Sub(lastRejectLog) < time.Second {
+			return
+		}
+		if suppressedRejects > 1 {
+			log.Printf("Rejecting control connection from %s: %s (and %d more since the previous line)", addr, reason, suppressedRejects-1)
+		} else {
+			log.Printf("Rejecting control connection from %s: %s", addr, reason)
+		}
+		lastRejectLog = now
+		suppressedRejects = 0
+	}
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -253,16 +291,26 @@ func (s *Server) startControlListener() error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
+		// Per-source limits first: they are what keeps one peer from consuming the
+		// global budget checked right after.
+		admitted, releaseIP, reason := s.controlLimiter.admit(limiterKey(conn.RemoteAddr()))
+		if !admitted {
+			logReject(conn.RemoteAddr(), reason)
+			conn.Close()
+			continue
+		}
 		if sem != nil {
 			select {
 			case sem <- struct{}{}:
 			default:
-				log.Printf("Control connection limit (%d) reached; rejecting %s", s.config.MaxControlConnections, conn.RemoteAddr())
+				logReject(conn.RemoteAddr(), fmt.Sprintf("global control connection limit (%d) reached", s.config.MaxControlConnections))
+				releaseIP()
 				conn.Close()
 				continue
 			}
 		}
 		go func(conn net.Conn) {
+			defer releaseIP()
 			if sem != nil {
 				defer func() { <-sem }()
 			}
@@ -995,22 +1043,34 @@ func (s *Server) countTunnelsForSession(session *yamux.Session) int {
 }
 
 func (s *Server) cleanupTunnelsForSession(session *yamux.Session) {
+	// Both locks are held across the whole scan (it has to visit every tunnel to
+	// find this session's), and httpTunnelsMu is the lock the public routing path
+	// takes on every request — so nothing slow may happen in here. Collect what
+	// was removed and log it afterwards: log.Printf serializes on its own mutex
+	// and writes to stderr, which made the hold time an order of magnitude longer
+	// than the map work itself (~22ms of 23ms with 10k tunnels).
+	type removedTunnel struct{ id, publicURL string }
+	var removed []removedTunnel
+
 	// Lock order: httpTunnelsMu -> tunnelsMu (same as setupHTTPTunnel to avoid deadlock)
 	s.httpTunnelsMu.Lock()
-	defer s.httpTunnelsMu.Unlock()
 	s.tunnelsMu.Lock()
-	defer s.tunnelsMu.Unlock()
-
 	for id, t := range s.tunnels {
 		if t.Session == session {
-			log.Printf("Cleaning up tunnel %s (%s) for disconnected client.", t.ID, t.PublicURL)
 			if t.Type == "http" {
 				host := strings.TrimPrefix(t.PublicURL, "http://")
 				host = strings.TrimPrefix(host, "https://")
 				delete(s.httpTunnels, host)
 			}
 			delete(s.tunnels, id)
+			removed = append(removed, removedTunnel{id: t.ID, publicURL: t.PublicURL})
 		}
+	}
+	s.tunnelsMu.Unlock()
+	s.httpTunnelsMu.Unlock()
+
+	for _, r := range removed {
+		log.Printf("Cleaned up tunnel %s (%s) for disconnected client.", r.id, r.publicURL)
 	}
 }
 

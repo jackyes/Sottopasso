@@ -91,16 +91,6 @@ func TestTunnelResponse_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestNewConnection_RoundTrip(t *testing.T) {
-	var nc NewConnection
-	if err := json.Unmarshal([]byte(`{"tunnel_id":"abc"}`), &nc); err != nil {
-		t.Fatal(err)
-	}
-	if nc.TunnelID != "abc" {
-		t.Errorf("TunnelID=%q, want abc", nc.TunnelID)
-	}
-}
-
 func TestControlMessage_MalformedPayloadDecodesLater(t *testing.T) {
 	// A ControlMessage with an invalid inner payload should still decode at the
 	// envelope level; only the inner Unmarshal should fail.

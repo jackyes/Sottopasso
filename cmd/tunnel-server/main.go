@@ -36,6 +36,11 @@ type ConfigYAML struct {
 	HTTPWriteTimeout       string   `yaml:"http_write_timeout"`
 	MaxHTTPRequestBytes    int64    `yaml:"max_http_request_bytes"`
 
+	// Per-source-address control-channel limits (IPv6 grouped by /64).
+	MaxControlConnsPerIP   int    `yaml:"max_control_conns_per_ip"`
+	ControlAttemptBurst    int    `yaml:"control_attempt_burst"`
+	ControlAttemptInterval string `yaml:"control_attempt_interval"`
+
 	// Max time for the tunnel client to deliver the response headers of a proxied
 	// HTTP request (the body may then stream without limit). "0s" = unlimited.
 	HTTPResponseHeaderTimeout string `yaml:"http_response_header_timeout"`
@@ -60,6 +65,9 @@ func main() {
 	configYAML.MaxTunnelsPerSession = 100
 	configYAML.MaxConnsPerTunnel = 256
 	configYAML.MaxControlConnections = 512
+	configYAML.MaxControlConnsPerIP = 32
+	configYAML.ControlAttemptBurst = 20
+	configYAML.ControlAttemptInterval = "500ms"
 	configYAML.HTTPReadTimeout = "0s"
 	configYAML.HTTPWriteTimeout = "0s"
 	configYAML.HTTPResponseHeaderTimeout = "30s"
@@ -115,6 +123,11 @@ func main() {
 		log.Fatalf("Invalid http_response_header_timeout format: %v", err)
 	}
 
+	controlAttemptInterval, err := time.ParseDuration(configYAML.ControlAttemptInterval)
+	if err != nil {
+		log.Fatalf("Invalid control_attempt_interval format: %v", err)
+	}
+
 	config := &server.Config{
 		ControlAddr:            configYAML.ControlAddr,
 		HTTPAddr:               configYAML.HTTPAddr,
@@ -136,6 +149,10 @@ func main() {
 		HTTPReadTimeout:        httpReadTimeout,
 		HTTPWriteTimeout:       httpWriteTimeout,
 		MaxHTTPRequestBytes:    configYAML.MaxHTTPRequestBytes,
+
+		MaxControlConnsPerIP:   configYAML.MaxControlConnsPerIP,
+		ControlAttemptBurst:    configYAML.ControlAttemptBurst,
+		ControlAttemptInterval: controlAttemptInterval,
 
 		HTTPResponseHeaderTimeout: httpResponseHeaderTimeout,
 	}

@@ -41,6 +41,23 @@ max_conns_per_tunnel: 256
 # Max concurrent control-channel connections (unauthenticated-flood protection).
 max_control_connections: 512
 
+# Per-source-address control-channel limits. max_control_connections above is a single
+# global budget, so on its own it does not stop one peer from taking all of it: a control
+# connection holds its slot for the whole session, and an unauthenticated one holds it
+# for the full 10s authentication deadline. IPv6 sources are grouped by /64, since a
+# single peer is usually handed a whole /64.
+#
+# max_control_conns_per_ip caps concurrent connections per source. Raise it if many
+# legitimate clients share one public address (a NAT'd office, a CI runner fleet).
+max_control_conns_per_ip: 32
+
+# Rate limit on new control connections per source: control_attempt_burst attempts
+# back-to-back, then one more every control_attempt_interval. Legitimate clients only
+# attempt on reconnect, so the burst is what absorbs a fleet restarting at once.
+# Set either to 0 to disable the rate limit (the concurrency cap above still applies).
+control_attempt_burst: 20
+control_attempt_interval: "500ms"
+
 # Public HTTP server read/write timeouts. Default "0s" = unlimited, which suits large
 # uploads/downloads through the tunnel. Set non-zero (e.g. "60s") to harden against
 # slow-body / slow-read clients when your tunnels only carry small payloads.

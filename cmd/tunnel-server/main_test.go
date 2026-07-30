@@ -82,6 +82,22 @@ func TestServerCLI_InvalidYAML(t *testing.T) {
 	}
 }
 
+func TestServerCLI_InvalidControlAttemptInterval(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "rate.yml")
+	content := "control_addr: \":0\"\ncontrol_attempt_interval: \"notaduration\"\n"
+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := runServer(t, "-config", cfg)
+	if code == 0 {
+		t.Errorf("expected non-zero exit for an invalid duration; output:\n%s", out)
+	}
+	if !strings.Contains(out, "Invalid control_attempt_interval") {
+		t.Errorf("want control_attempt_interval duration error; got:\n%s", out)
+	}
+}
+
 func TestServerCLI_InvalidDuration(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "dur.yml")

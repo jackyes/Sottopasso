@@ -14,8 +14,6 @@ const (
 	RequestTunnelType MessageType = "req-tunnel"
 	// TunnelResponseType is the type for a tunnel creation response.
 	TunnelResponseType MessageType = "tunnel-resp"
-	// NewConnectionType is the type for notifying a new public connection.
-	NewConnectionType MessageType = "new-conn"
 )
 
 // ControlMessage is a generic wrapper for all control messages.
@@ -47,12 +45,4 @@ type RequestTunnel struct {
 type TunnelResponse struct {
 	PublicURL string `json:"public_url"`
 	Error     string `json:"error,omitempty"`
-}
-
-// NewConnection notifies the client that a new external connection
-// has been received and must be handled.
-type NewConnection struct {
-	// The ID of the tunnel to which this connection belongs, for future implementations
-	// where a client can have multiple tunnels.
-	TunnelID string `json:"tunnel_id"`
 }
