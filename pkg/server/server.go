@@ -584,9 +584,7 @@ func (s *Server) closeTunnel(t *Tunnel) {
 	s.httpTunnelsMu.Lock()
 	s.tunnelsMu.Lock()
 	if t.Type == "http" {
-		host := strings.TrimPrefix(t.PublicURL, "http://")
-		host = strings.TrimPrefix(host, "https://")
-		delete(s.httpTunnels, host)
+		delete(s.httpTunnels, httpRoutingHost(t.PublicURL))
 	}
 	delete(s.tunnels, t.ID)
 	s.tunnelsMu.Unlock()
@@ -833,9 +831,29 @@ func removeHopByHopHeaders(h http.Header) {
 	}
 }
 
+// httpRoutingHost returns the key under which an HTTP tunnel is registered in
+// httpTunnels: the Host-header form (subdomain + domain host, lowercase, with any
+// port removed). ServeHTTP, setupHTTPTunnel, closeTunnel and cleanupTunnelsForSession
+// must all derive this key the same way or lookups and teardown will miss entries.
+func httpRoutingHost(publicURL string) string {
+	host := strings.TrimPrefix(publicURL, "http://")
+	host = strings.TrimPrefix(host, "https://")
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return strings.ToLower(host)
+}
+
 func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
 	if s.config.MaxHTTPRequestBytes > 0 && r.Body != nil {
+		// Fast-path reject a request whose declared size already exceeds the
+		// limit; MaxBytesReader below still guards chunked or under-declared
+		// bodies that are only discovered while the request is relayed.
+		if r.ContentLength > s.config.MaxHTTPRequestBytes {
+			http.Error(w, "Request body too large.", http.StatusRequestEntityTooLarge)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxHTTPRequestBytes)
 	}
 	stream, err := t.Session.OpenStream()
@@ -846,34 +864,37 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	}
 	defer stream.Close()
 
-	// Bound the round-trip with the tunnel client (request relay + response
-	// headers) so a stalled backend cannot pin this handler goroutine and its
-	// yamux stream forever. The deadline is cleared before the body copy:
-	// response bodies may legitimately stream for a long time.
-	if d := s.config.HTTPResponseHeaderTimeout; d > 0 {
-		stream.SetDeadline(time.Now().Add(d))
-	}
-
 	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
 
 	// net/http answers the visitor's "Expect: 100-continue" itself (it sends the
 	// interim 100 when the body is first read), so the header must not be relayed:
 	// the backend's own "100 Continue" would be mistaken for the final response.
 	r.Header.Del("Expect")
+	// Hop-by-hop headers describe the tunnel connection, not the request the
+	// backend should see (RFC 7230 6.1). Forwarding them lets a backend desync
+	// framing or poison downstream caches; mirror the response-side filtering.
+	removeHopByHopHeaders(r.Header)
 
-	// Write the HTTP request to the tunnel stream
-	if err := r.Write(mStream); err != nil {
-		log.Printf("Error writing request to stream: %v", err)
-		// Request.Write wraps body-read errors in an unexported type with no
-		// Unwrap method, so errors.As alone cannot see the MaxBytesError from
-		// MaxBytesReader — fall back to its (stable) message.
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) || strings.Contains(err.Error(), "http: request body too large") {
-			http.Error(w, "Request body too large.", http.StatusRequestEntityTooLarge)
-		} else {
-			http.Error(w, "Bad gateway.", http.StatusBadGateway)
+	// Relay the request in the background so the backend's response can be read
+	// and forwarded as soon as it is produced. A backend that answers early
+	// (401/413/redirect) without consuming the request body must not deadlock the
+	// relay on the body upload.
+	reqErr := make(chan error, 1)
+	go func() {
+		err := r.Write(mStream)
+		reqErr <- err
+		if err != nil {
+			// The request could not be relayed (e.g. body too large); abort the
+			// pending response read so the handler can report it.
+			stream.Close()
 		}
-		return
+	}()
+
+	// Bound the round-trip with the tunnel client for the response headers only:
+	// response bodies may stream indefinitely, and the request upload is governed
+	// by the public server's read timeout, not this deadline.
+	if d := s.config.HTTPResponseHeaderTimeout; d > 0 {
+		stream.SetReadDeadline(time.Now().Add(d))
 	}
 
 	// Read the HTTP response from the tunnel stream. Interim 1xx responses
@@ -889,6 +910,26 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		resp, err = http.ReadResponse(br, r)
 	}
 	if err != nil {
+		// If the background relay failed (for example a body over the limit), its
+		// stream close is what unblocked this read. Report that failure rather
+		// than a generic gateway error.
+		var reqWriteErr error
+		select {
+		case reqWriteErr = <-reqErr:
+		default:
+		}
+		if reqWriteErr != nil {
+			// Request.Write wraps body-read errors in an unexported type with no
+			// Unwrap method, so errors.As alone cannot see the MaxBytesError from
+			// MaxBytesReader — fall back to its (stable) message.
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(reqWriteErr, &maxBytesErr) || strings.Contains(reqWriteErr.Error(), "http: request body too large") {
+				http.Error(w, "Request body too large.", http.StatusRequestEntityTooLarge)
+			} else {
+				http.Error(w, "Bad gateway.", http.StatusBadGateway)
+			}
+			return
+		}
 		// Nothing has been written to w yet, so a clean 502 is safe. Returning
 		// without a status would make net/http send an implicit empty 200, and a
 		// dead backend would look healthy to the visitor.
@@ -898,9 +939,18 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		http.Error(w, "Bad gateway: the tunnel client did not return a response.", http.StatusBadGateway)
 		return
 	}
+
+	// The iteration cap above keeps a misbehaving backend from spinning the loop;
+	// a response that is still interim here means the cap was hit. Fail rather
+	// than relaying a 1xx as the final response.
+	if resp.StatusCode >= 100 && resp.StatusCode < 200 && resp.StatusCode != http.StatusSwitchingProtocols {
+		resp.Body.Close()
+		http.Error(w, "Bad gateway: the tunnel client sent too many interim responses.", http.StatusBadGateway)
+		return
+	}
 	defer resp.Body.Close()
 
-	stream.SetDeadline(time.Time{})
+	stream.SetReadDeadline(time.Time{})
 
 	// The backend (the tunnel client's own service) controls the remaining response
 	// headers, including Set-Cookie/CORS/Location for its own public hostname — that is
@@ -1058,9 +1108,7 @@ func (s *Server) cleanupTunnelsForSession(session *yamux.Session) {
 	for id, t := range s.tunnels {
 		if t.Session == session {
 			if t.Type == "http" {
-				host := strings.TrimPrefix(t.PublicURL, "http://")
-				host = strings.TrimPrefix(host, "https://")
-				delete(s.httpTunnels, host)
+				delete(s.httpTunnels, httpRoutingHost(t.PublicURL))
 			}
 			delete(s.tunnels, id)
 			removed = append(removed, removedTunnel{id: t.ID, publicURL: t.PublicURL})
@@ -1124,11 +1172,13 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	var subdomain string
 	var host string
 
-	domain := s.config.Domain
-	if h, _, err := net.SplitHostPort(domain); err == nil {
-		domain = h
+	// routingDomain is the Host-header key component (lowercase, port stripped).
+	// The public URL instead keeps the configured Domain verbatim so an embedded
+	// port survives into the address users actually dial.
+	routingDomain := strings.ToLower(s.config.Domain)
+	if h, _, err := net.SplitHostPort(routingDomain); err == nil {
+		routingDomain = strings.ToLower(h)
 	}
-	domain = strings.ToLower(domain)
 
 	// Validate a client-requested subdomain: it must be a single lowercase DNS label.
 	// Reject (rather than silently ignore) malformed input so a client cannot inject
@@ -1146,7 +1196,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	defer s.httpTunnelsMu.Unlock()
 
 	if req.Subdomain != "" {
-		potentialHost := fmt.Sprintf("%s.%s", req.Subdomain, domain)
+		potentialHost := fmt.Sprintf("%s.%s", req.Subdomain, routingDomain)
 		if _, exists := s.httpTunnels[potentialHost]; !exists {
 			subdomain = req.Subdomain
 			host = potentialHost
@@ -1159,7 +1209,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	if host == "" {
 		for {
 			subdomain = uuid.New().String()[:8]
-			host = fmt.Sprintf("%s.%s", subdomain, domain)
+			host = fmt.Sprintf("%s.%s", subdomain, routingDomain)
 			if _, exists := s.httpTunnels[host]; !exists {
 				break
 			}
@@ -1174,7 +1224,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	tunnel := &Tunnel{
 		ID:         uuid.New().String(),
 		Type:       "http",
-		PublicURL:  fmt.Sprintf("%s://%s", schema, host),
+		PublicURL:  fmt.Sprintf("%s://%s.%s", schema, subdomain, s.config.Domain),
 		ClientAddr: session.RemoteAddr().String(),
 		Status:     "active",
 		CreatedAt:  time.Now(),
@@ -1195,7 +1245,38 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 		Type:       protocol.TunnelResponseType,
 		RawPayload: payload,
 	}
-	return json.NewEncoder(ctrlStream).Encode(respMsg)
+	if err := json.NewEncoder(ctrlStream).Encode(respMsg); err != nil {
+		// Deregister the tunnel: leaving it published would show a ghost entry
+		// (with a live routing key but no client that knows its URL) until the
+		// whole session is cleaned up. Mirrors setupTCPTunnel.
+		s.tunnelsMu.Lock()
+		delete(s.tunnels, tunnel.ID)
+		s.tunnelsMu.Unlock()
+		delete(s.httpTunnels, host)
+		return fmt.Errorf("error sending TunnelResponse: %w", err)
+	}
+	return nil
+}
+
+// tcpPublicAddr builds the address advertised for a TCP tunnel. The listener is
+// bound to the wildcard ":0", whose Addr ("[::]:port" or "0.0.0.0:port") is not a
+// destination a client can dial. Advertise the configured Domain host instead when
+// one is set (it resolves to this server), keeping the assigned port; otherwise
+// fall back to the listener's own address.
+func (s *Server) tcpPublicAddr(listener net.Listener) string {
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		return listener.Addr().String()
+	}
+	host := s.config.Domain
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(host)
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return listener.Addr().String()
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Session, ctrlStream net.Conn) error {
@@ -1204,7 +1285,7 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 		return fmt.Errorf("unable to start TCP listener: %w", err)
 	}
 
-	publicAddr := listener.Addr().String()
+	publicAddr := s.tcpPublicAddr(listener)
 	tunnel := &Tunnel{
 		ID:         uuid.New().String(),
 		Type:       "tcp",

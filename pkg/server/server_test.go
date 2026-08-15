@@ -650,7 +650,7 @@ func TestHandleRequestTunnel_UnsupportedType(t *testing.T) {
 }
 
 func TestSetupHTTPTunnel_RequestedSubdomain(t *testing.T) {
-	s := New(&Config{Domain: "localhost:8001"}) // port must be stripped
+	s := New(&Config{Domain: "localhost:8001"}) // the port must survive into the public URL
 	sess, _ := newYamuxPair(t)
 	ctrl1, ctrl2 := net.Pipe()
 	defer ctrl1.Close()
@@ -667,9 +667,11 @@ func TestSetupHTTPTunnel_RequestedSubdomain(t *testing.T) {
 	}
 	var tr protocol.TunnelResponse
 	json.Unmarshal(resp.RawPayload, &tr)
-	if tr.PublicURL != "http://myapp.localhost" {
-		t.Errorf("PublicURL=%q, want http://myapp.localhost", tr.PublicURL)
+	if tr.PublicURL != "http://myapp.localhost:8001" {
+		t.Errorf("PublicURL=%q, want http://myapp.localhost:8001", tr.PublicURL)
 	}
+	// The routing key is still the host-only form (no port), matching ServeHTTP's
+	// Host-header lookup.
 	if _, ok := s.httpTunnels["myapp.localhost"]; !ok {
 		t.Error("expected httpTunnels to contain myapp.localhost")
 	}

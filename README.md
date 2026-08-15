@@ -177,6 +177,11 @@ INFO[...] Public tunnel available at: 127.0.0.1:54321
 INFO[...] Forwarding to: localhost:22
 ```
 
+The host portion of a TCP tunnel's advertised address is taken from the server's
+`domain` setting (its host part, e.g. `localhost` for `domain: "localhost:8001"`),
+so the URL is dialable. When `domain` is empty the server falls back to its own
+bind address.
+
 ### 3. Access the Dashboard
 
 Open your browser and go to the configured address (e.g., `https://localhost:4040`). You will be prompted for the credentials defined in `config.server.yml` (`admin`/`sottopasso` in the example). You will see a table with all active tunnels and their traffic, which updates every 5 seconds.

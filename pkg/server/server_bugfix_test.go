@@ -1,9 +1,11 @@
 package server
 
 import (
+	"Sottopasso/pkg/protocol"
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -203,4 +205,185 @@ func TestShutdown_ClosesClientSessions(t *testing.T) {
 	if !sess.IsClosed() {
 		t.Error("Shutdown must close active client sessions")
 	}
+}
+
+// A backend that answers before consuming the (large) request body must have its
+// response relayed, not lost behind a request upload that blocks on flow control.
+func TestHandleHTTPRequest_BackendEarlyResponseIsRelayed(t *testing.T) {
+	s := New(&Config{Domain: "localhost"})
+	serverSess, clientSess := newYamuxPair(t)
+	tun := &Tunnel{ID: "x", Type: "http", PublicURL: "http://abc.localhost", Status: "active", CreatedAt: time.Now(), Session: serverSess}
+
+	go func() {
+		stream, err := clientSess.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+		// Respond immediately, without reading the request body.
+		io.WriteString(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	}()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "http://abc.localhost/", strings.NewReader(strings.Repeat("A", 1<<20)))
+	runHandleHTTPRequest(t, s, rec, req, tun)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "ok" {
+		t.Errorf("body=%q, want ok", rec.Body.String())
+	}
+}
+
+// Hop-by-hop request headers must be stripped before the request is relayed, just
+// like the response side.
+func TestHandleHTTPRequest_StripsRequestHopByHopHeaders(t *testing.T) {
+	s := New(&Config{Domain: "localhost"})
+	serverSess, clientSess := newYamuxPair(t)
+	tun := &Tunnel{ID: "x", Type: "http", PublicURL: "http://abc.localhost", Status: "active", CreatedAt: time.Now(), Session: serverSess}
+
+	backendErr := make(chan error, 1)
+	go func() {
+		stream, err := clientSess.AcceptStream()
+		if err != nil {
+			backendErr <- err
+			return
+		}
+		defer stream.Close()
+		relayed, err := http.ReadRequest(bufio.NewReader(stream))
+		if err != nil {
+			backendErr <- err
+			return
+		}
+		for _, h := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "TE", "Upgrade", "X-Custom"} {
+			if v := relayed.Header.Get(h); v != "" {
+				backendErr <- fmt.Errorf("hop-by-hop header %s was relayed: %q", h, v)
+				return
+			}
+		}
+		backendErr <- nil
+		io.WriteString(stream, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+	}()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "http://abc.localhost/", strings.NewReader("hi"))
+	req.Header.Set("Connection", "keep-alive, X-Custom")
+	req.Header.Set("Proxy-Connection", "keep-alive")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("TE", "trailers")
+	req.Header.Set("Upgrade", "h2c")
+	req.Header.Set("X-Custom", "secret")
+	runHandleHTTPRequest(t, s, rec, req, tun)
+
+	if err := <-backendErr; err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("code=%d, want 200", rec.Code)
+	}
+}
+
+// A backend that floods interim 1xx responses past the cap must not have one of
+// them relayed as the final response.
+func TestHandleHTTPRequest_TooManyInterimResponsesIs502(t *testing.T) {
+	s := New(&Config{Domain: "localhost"})
+	serverSess, clientSess := newYamuxPair(t)
+	tun := &Tunnel{ID: "x", Type: "http", PublicURL: "http://abc.localhost", Status: "active", CreatedAt: time.Now(), Session: serverSess}
+
+	go func() {
+		stream, err := clientSess.AcceptStream()
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+		if _, err := http.ReadRequest(bufio.NewReader(stream)); err != nil {
+			return
+		}
+		for i := 0; i < 6; i++ {
+			io.WriteString(stream, "HTTP/1.1 100 Continue\r\n\r\n")
+		}
+	}()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://abc.localhost/", nil)
+	runHandleHTTPRequest(t, s, rec, req, tun)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("code=%d, want 502 when interim responses exceed the cap", rec.Code)
+	}
+}
+
+// setupHTTPTunnel must deregister the tunnel when it cannot send the response,
+// mirroring setupTCPTunnel, so no ghost entry survives a broken control stream.
+func TestSetupHTTPTunnel_DeregistersOnResponseSendFailure(t *testing.T) {
+	s := New(&Config{Domain: "localhost"})
+	sess, _ := newYamuxPair(t)
+
+	ctrl1, ctrl2 := net.Pipe()
+	ctrl2.Close() // force the response write to fail
+	defer ctrl1.Close()
+
+	err := s.setupHTTPTunnel(protocol.RequestTunnel{Type: "http", Subdomain: "myapp"}, sess, ctrl1)
+	if err == nil {
+		t.Fatal("setupHTTPTunnel should fail when the control stream is closed")
+	}
+	if len(s.tunnels) != 0 {
+		t.Errorf("tunnels map not empty after send failure: %d entries", len(s.tunnels))
+	}
+	s.httpTunnelsMu.RLock()
+	_, ok := s.httpTunnels["myapp.localhost"]
+	s.httpTunnelsMu.RUnlock()
+	if ok {
+		t.Error("httpTunnels still contains the tunnel after send failure")
+	}
+}
+
+func TestHTTPRoutingHost(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://abc.localhost", "abc.localhost"},
+		{"http://abc.localhost:8001", "abc.localhost"},
+		{"https://abc.example.com:443", "abc.example.com"},
+		{"https://ABC.Example.com", "abc.example.com"},
+	}
+	for _, c := range cases {
+		if got := httpRoutingHost(c.in); got != c.want {
+			t.Errorf("httpRoutingHost(%q)=%q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// tcpPublicAddr must advertise a dialable host (the configured Domain host) rather
+// than the listener's wildcard bind address.
+func TestTCPPublicAddr(t *testing.T) {
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("domain host", func(t *testing.T) {
+		s := New(&Config{Domain: "tunnel.example.com"})
+		want := net.JoinHostPort("tunnel.example.com", port)
+		if got := s.tcpPublicAddr(ln); got != want {
+			t.Errorf("tcpPublicAddr=%q, want %q", got, want)
+		}
+	})
+	t.Run("domain with port", func(t *testing.T) {
+		s := New(&Config{Domain: "localhost:8001"})
+		want := net.JoinHostPort("localhost", port)
+		if got := s.tcpPublicAddr(ln); got != want {
+			t.Errorf("tcpPublicAddr=%q, want %q", got, want)
+		}
+	})
+	t.Run("no domain falls back to listener addr", func(t *testing.T) {
+		s := New(&Config{})
+		if got := s.tcpPublicAddr(ln); got != ln.Addr().String() {
+			t.Errorf("tcpPublicAddr=%q, want %q", got, ln.Addr().String())
+		}
+	})
 }

@@ -4,7 +4,6 @@ import (
 	"Sottopasso/pkg/server"
 	"flag"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -81,13 +80,6 @@ func main() {
 	}
 	if *connectionWriteTimeout != "" {
 		configYAML.ConnectionWriteTimeout = *connectionWriteTimeout
-	}
-
-	// Strip port from domain if present — users often include it, but the domain
-	// is used to construct subdomain-based host keys that are looked up by Host header
-	// (which has its port stripped by ServeHTTP).
-	if h, _, err := net.SplitHostPort(configYAML.Domain); err == nil {
-		configYAML.Domain = h
 	}
 
 	keepalive, err := time.ParseDuration(configYAML.KeepaliveInterval)
