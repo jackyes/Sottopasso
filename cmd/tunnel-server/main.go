@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 // ConfigYAML reflects the structure of the config.server.yml file
@@ -43,6 +43,21 @@ type ConfigYAML struct {
 	// Max time for the tunnel client to deliver the response headers of a proxied
 	// HTTP request (the body may then stream without limit). "0s" = unlimited.
 	HTTPResponseHeaderTimeout string `yaml:"http_response_header_timeout"`
+
+	// Max concurrent public requests/hijacked connections per HTTP tunnel (0 = unlimited).
+	MaxHTTPConnsPerTunnel int `yaml:"max_http_conns_per_tunnel"`
+
+	// Reap hijacked (WebSocket/SSE) connections with no traffic in either
+	// direction for this long. "0s" = unlimited.
+	HijackedIdleTimeout string `yaml:"hijacked_idle_timeout"`
+
+	// Dashboard auth throttling: lock a source out for dashboard_auth_lockout
+	// after this many failed Basic Auth attempts (0 = disabled).
+	DashboardAuthMaxFailures int    `yaml:"dashboard_auth_max_failures"`
+	DashboardAuthLockout     string `yaml:"dashboard_auth_lockout"`
+
+	// Additional subdomains clients may not claim (on top of www/admin/dashboard).
+	ReservedSubdomains []string `yaml:"reserved_subdomains"`
 }
 
 func main() {
@@ -67,9 +82,14 @@ func main() {
 	configYAML.MaxControlConnsPerIP = 32
 	configYAML.ControlAttemptBurst = 20
 	configYAML.ControlAttemptInterval = "500ms"
-	configYAML.HTTPReadTimeout = "0s"
-	configYAML.HTTPWriteTimeout = "0s"
+	configYAML.HTTPReadTimeout = "60s"
+	configYAML.HTTPWriteTimeout = "5m"
 	configYAML.HTTPResponseHeaderTimeout = "30s"
+	configYAML.MaxHTTPRequestBytes = 100 << 20
+	configYAML.MaxHTTPConnsPerTunnel = 256
+	configYAML.HijackedIdleTimeout = "30m"
+	configYAML.DashboardAuthMaxFailures = 5
+	configYAML.DashboardAuthLockout = "1m"
 	if err := yaml.Unmarshal(yamlFile, &configYAML); err != nil {
 		log.Fatalf("Error parsing YAML file: %v", err)
 	}
@@ -115,6 +135,16 @@ func main() {
 		log.Fatalf("Invalid http_response_header_timeout format: %v", err)
 	}
 
+	hijackedIdleTimeout, err := time.ParseDuration(configYAML.HijackedIdleTimeout)
+	if err != nil {
+		log.Fatalf("Invalid hijacked_idle_timeout format: %v", err)
+	}
+
+	dashboardAuthLockout, err := time.ParseDuration(configYAML.DashboardAuthLockout)
+	if err != nil {
+		log.Fatalf("Invalid dashboard_auth_lockout format: %v", err)
+	}
+
 	controlAttemptInterval, err := time.ParseDuration(configYAML.ControlAttemptInterval)
 	if err != nil {
 		log.Fatalf("Invalid control_attempt_interval format: %v", err)
@@ -147,6 +177,12 @@ func main() {
 		ControlAttemptInterval: controlAttemptInterval,
 
 		HTTPResponseHeaderTimeout: httpResponseHeaderTimeout,
+
+		MaxHTTPConnsPerTunnel:    configYAML.MaxHTTPConnsPerTunnel,
+		HijackedIdleTimeout:      hijackedIdleTimeout,
+		DashboardAuthMaxFailures: configYAML.DashboardAuthMaxFailures,
+		DashboardAuthLockout:     dashboardAuthLockout,
+		ReservedSubdomains:       configYAML.ReservedSubdomains,
 	}
 
 	srv := server.New(config)

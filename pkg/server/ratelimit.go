@@ -43,7 +43,6 @@ type ipLimiter struct {
 	burst     float64       // token bucket capacity per key (0 = no rate limit)
 	interval  time.Duration // one token is restored every interval
 	lastSweep time.Time
-	lastWarn  time.Time
 
 	// now is the clock, replaced in tests to drive refills deterministically.
 	now func() time.Time
@@ -98,15 +97,11 @@ func (l *ipLimiter) admit(key string) (ok bool, release func(), reason string) {
 		if len(l.entries) >= maxTrackedIPs {
 			l.sweepLocked(now)
 		}
-		if len(l.entries) >= maxTrackedIPs {
-			// Fail open: refusing unknown keys would turn a table filled with
-			// rotated addresses into a lockout for every legitimate client, and
-			// MaxControlConnections still bounds the total damage.
-			if now.Sub(l.lastWarn) >= time.Minute {
-				l.lastWarn = now
-				log.Printf("Per-IP control limiter: tracking table full (%d keys); admitting %s without per-IP limits", len(l.entries), key)
-			}
-			return true, noop, ""
+		if len(l.entries) >= maxTrackedIPs && !l.evictOldestIdleLocked() {
+			// Every tracked key holds a live connection: the per-IP budget is
+			// fully consumed, so refuse instead of admitting without per-IP
+			// limits (MaxControlConnections still bounds the global damage).
+			return false, noop, fmt.Sprintf("per-IP tracking table full (%d keys)", len(l.entries))
 		}
 		e = &ipEntry{tokens: l.burst, lastSeen: now}
 		l.entries[key] = e
@@ -190,4 +185,164 @@ func limiterKey(addr net.Addr) string {
 		return v4.String()
 	}
 	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// stringAddr adapts a "host:port" string (http.Request.RemoteAddr is a string,
+// not a net.Addr) so limiterKey can reduce it the same way as a dialed
+// connection's address.
+type stringAddr string
+
+func (a stringAddr) Network() string { return "tcp" }
+func (a stringAddr) String() string  { return string(a) }
+
+// limiterKeyFromString is limiterKey for an address in string form.
+func limiterKeyFromString(addr string) string {
+	return limiterKey(stringAddr(addr))
+}
+
+// evictOldestIdleLocked removes the least-recently-seen key that holds no
+// connection, making room for a new key. It reports false when every tracked
+// key has a live connection.
+func (l *ipLimiter) evictOldestIdleLocked() bool {
+	var oldestKey string
+	var oldest time.Time
+	found := false
+	for key, e := range l.entries {
+		if e.active == 0 && (!found || e.lastSeen.Before(oldest)) {
+			oldestKey, oldest, found = key, e.lastSeen, true
+		}
+	}
+	if !found {
+		return false
+	}
+	delete(l.entries, oldestKey)
+	return true
+}
+
+// authFailEntry is the per-key state of the authentication-failure limiter.
+type authFailEntry struct {
+	fails       int
+	windowStart time.Time
+	lockedUntil time.Time
+}
+
+// authFailLimiter throttles repeated authentication failures per source key:
+// once a key records maxFails failures within window, it is locked out for
+// lockout and every request from it is refused before credentials are checked.
+// A nil *authFailLimiter enforces nothing, so callers need no nil checks.
+type authFailLimiter struct {
+	mu        sync.Mutex
+	entries   map[string]*authFailEntry
+	maxFails  int
+	window    time.Duration
+	lockout   time.Duration
+	lastSweep time.Time
+
+	// now is the clock, replaced in tests to drive expiry deterministically.
+	now func() time.Time
+}
+
+// newAuthFailLimiter returns a limiter for the given limits, or nil when
+// disabled (either value non-positive).
+func newAuthFailLimiter(maxFails int, lockout time.Duration) *authFailLimiter {
+	if maxFails <= 0 || lockout <= 0 {
+		return nil
+	}
+	return &authFailLimiter{
+		entries:  make(map[string]*authFailEntry),
+		maxFails: maxFails,
+		window:   lockout,
+		lockout:  lockout,
+		now:      time.Now,
+	}
+}
+
+// allow reports whether a request from key may proceed to credential checking.
+func (l *authFailLimiter) allow(key string) bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	l.sweepLocked(now)
+	e := l.entries[key]
+	return e == nil || e.lockedUntil.IsZero() || !now.Before(e.lockedUntil)
+}
+
+// recordFail registers one failed authentication attempt from key.
+func (l *authFailLimiter) recordFail(key string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	l.sweepLocked(now)
+	e := l.entries[key]
+	if e == nil {
+		if len(l.entries) >= maxTrackedIPs {
+			l.sweepLocked(now)
+		}
+		if len(l.entries) >= maxTrackedIPs {
+			// Fail open here: the table is full of recently-failed sources,
+			// and refusing would lock out legitimate clients sharing the
+			// address space behind a rotating attacker.
+			l.evictOldestLocked(now)
+		}
+		e = &authFailEntry{}
+		l.entries[key] = e
+	}
+	if !e.lockedUntil.IsZero() {
+		return // already locked out; a new failure does not extend the lockout
+	}
+	if now.Sub(e.windowStart) > l.window {
+		e.fails = 0
+	}
+	if e.fails == 0 {
+		e.windowStart = now
+	}
+	e.fails++
+	if e.fails >= l.maxFails {
+		e.lockedUntil = now.Add(l.lockout)
+		e.fails = 0
+		e.windowStart = time.Time{}
+		log.Printf("Auth limiter: locked out %s for %s after %d failed attempts", key, l.lockout, l.maxFails)
+	}
+}
+
+// sweepLocked drops entries whose window or lockout has expired. Throttled to
+// once per ipLimiterSweepInterval: it is called on the request path.
+func (l *authFailLimiter) sweepLocked(now time.Time) {
+	if now.Sub(l.lastSweep) < ipLimiterSweepInterval {
+		return
+	}
+	l.lastSweep = now
+	for key, e := range l.entries {
+		expired := !e.lockedUntil.IsZero() && !now.Before(e.lockedUntil)
+		expired = expired || (e.lockedUntil.IsZero() && !e.windowStart.IsZero() && now.Sub(e.windowStart) > l.window)
+		if expired {
+			delete(l.entries, key)
+		}
+	}
+}
+
+// evictOldestLocked removes the entry with the oldest activity to make room
+// for a new key.
+func (l *authFailLimiter) evictOldestLocked(now time.Time) {
+	var oldestKey string
+	var oldest time.Time
+	found := false
+	for key, e := range l.entries {
+		last := e.lockedUntil
+		if last.IsZero() {
+			last = e.windowStart
+		}
+		if !found || last.Before(oldest) {
+			oldestKey, oldest, found = key, last, true
+		}
+	}
+	if found {
+		delete(l.entries, oldestKey)
+	}
 }

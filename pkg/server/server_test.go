@@ -591,9 +591,15 @@ func TestAuthenticate_PreservesPipelinedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf.Write(pipelined)
-	if _, err := c2.Write(buf.Bytes()); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	// Write from a goroutine: a stream JSON decoder reads at most up to its
+	// buffer past the message, so a single Write on the synchronous pipe stays
+	// blocked until the pipelined bytes are consumed — which would deadlock
+	// against authenticate's response write below.
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := c2.Write(buf.Bytes())
+		writeErr <- err
+	}()
 
 	// Consume the auth response so authenticate can finish.
 	var resp protocol.ControlMessage
@@ -611,6 +617,9 @@ func TestAuthenticate_PreservesPipelinedBytes(t *testing.T) {
 	}
 	if string(got) != string(pipelined) {
 		t.Errorf("got %q, want %q (pipelined bytes must survive, newline must be dropped)", got, pipelined)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write: %v", err)
 	}
 }
 

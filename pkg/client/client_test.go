@@ -104,7 +104,7 @@ func TestRequestTunnel_Success(t *testing.T) {
 	resCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		url, err := c.requestTunnel(c1, json.NewDecoder(c1))
+		url, err := c.requestTunnel(c1, newControlDecoder(c1))
 		resCh <- url
 		errCh <- err
 	}()
@@ -136,7 +136,7 @@ func TestRequestTunnel_ServerError(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := c.requestTunnel(c1, json.NewDecoder(c1))
+		_, err := c.requestTunnel(c1, newControlDecoder(c1))
 		errCh <- err
 	}()
 
@@ -157,7 +157,7 @@ func TestRequestTunnel_UnexpectedType(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := c.requestTunnel(c1, json.NewDecoder(c1))
+		_, err := c.requestTunnel(c1, newControlDecoder(c1))
 		errCh <- err
 	}()
 

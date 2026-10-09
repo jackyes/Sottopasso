@@ -81,6 +81,58 @@ func (c *prefixConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
+// maxControlMessageSize bounds the bytes a single control message may occupy on
+// the wire.
+const maxControlMessageSize = 1 << 20 // 1 MiB
+
+// errControlMessageTooLarge is returned once a single message exceeds
+// maxControlMessageSize.
+var errControlMessageTooLarge = errors.New("control message exceeds maximum size")
+
+// resettableLimitReader is an io.LimitReader whose budget can be restored with
+// reset, so a single json.Decoder can be reused across messages while still
+// bounding each one (mirrors the server side).
+type resettableLimitReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (l *resettableLimitReader) Read(p []byte) (int, error) {
+	if l.remaining <= 0 {
+		return 0, errControlMessageTooLarge
+	}
+	if int64(len(p)) > l.remaining {
+		p = p[:l.remaining]
+	}
+	n, err := l.r.Read(p)
+	l.remaining -= int64(n)
+	return n, err
+}
+
+func (l *resettableLimitReader) reset(limit int64) {
+	l.remaining = limit
+}
+
+// controlDecoder decodes newline-delimited control messages, bounding each
+// message to maxControlMessageSize. The budget is per message, not cumulative
+// over the stream's lifetime.
+type controlDecoder struct {
+	dec     *json.Decoder
+	limited *resettableLimitReader
+}
+
+func newControlDecoder(r io.Reader) *controlDecoder {
+	limited := &resettableLimitReader{r: r, remaining: maxControlMessageSize}
+	return &controlDecoder{dec: json.NewDecoder(limited), limited: limited}
+}
+
+// Decode reads the next control message and restores the per-message budget.
+func (d *controlDecoder) Decode(v any) error {
+	err := d.dec.Decode(v)
+	d.limited.reset(maxControlMessageSize)
+	return err
+}
+
 // nextBackoff doubles cur, clamped to max.
 func nextBackoff(cur, max time.Duration) time.Duration {
 	if cur <= 0 {
@@ -222,8 +274,9 @@ func (c *Client) runSession(ctx context.Context, onEstablished func()) error {
 
 	// One decoder for the control stream's lifetime: a throwaway decoder per
 	// response would discard bytes it buffered past the current message, losing
-	// pipelined responses (the same bug once fixed on the server side).
-	ctrlDec := json.NewDecoder(io.LimitReader(ctrlStream, 1<<20))
+	// pipelined responses (the same bug once fixed on the server side). The size
+	// budget is per message, reset after every decode — not cumulative.
+	ctrlDec := newControlDecoder(ctrlStream)
 
 	publicURL, err := c.requestTunnel(ctrlStream, ctrlDec)
 	if err != nil {
@@ -288,7 +341,7 @@ func (c *Client) runSession(ctx context.Context, onEstablished func()) error {
 
 // requestTunnel sends a tunnel creation request and waits for the response.
 // dec must be the control stream's long-lived decoder, shared across requests.
-func (c *Client) requestTunnel(ctrlStream net.Conn, dec *json.Decoder) (string, error) {
+func (c *Client) requestTunnel(ctrlStream net.Conn, dec *controlDecoder) (string, error) {
 	req := protocol.RequestTunnel{
 		Type:      c.config.TunnelType,
 		LocalPort: c.config.LocalPort,
@@ -310,7 +363,7 @@ func (c *Client) requestTunnel(ctrlStream net.Conn, dec *json.Decoder) (string, 
 	}
 
 	if respMsg.Type != protocol.TunnelResponseType {
-		return "", fmt.Errorf("received unexpected message type %s", respMsg.Type)
+		return "", fmt.Errorf("received unexpected message type %q", respMsg.Type)
 	}
 
 	var tunnelResp protocol.TunnelResponse

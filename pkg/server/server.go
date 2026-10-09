@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -23,7 +24,9 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +51,10 @@ type Tunnel struct {
 	// listener is the public listener of a TCP tunnel (nil for HTTP tunnels).
 	// Set before the tunnel is published in the maps, never mutated afterwards.
 	listener net.Listener
+
+	// sem bounds concurrent public requests for an HTTP tunnel (nil = unlimited,
+	// or the tunnel is a TCP tunnel, whose limit lives in its accept loop).
+	sem chan struct{}
 }
 
 // Config contains the server configuration.
@@ -89,6 +96,25 @@ type Config struct {
 	// It does not apply to the response body, which may stream indefinitely.
 	// (0 = unlimited)
 	HTTPResponseHeaderTimeout time.Duration
+
+	// MaxHTTPConnsPerTunnel bounds concurrent public requests/hijacked connections
+	// per HTTP tunnel (0 = unlimited).
+	MaxHTTPConnsPerTunnel int
+
+	// HijackedIdleTimeout reaps hijacked (WebSocket/SSE) connections with no
+	// traffic in either direction for this long (0 = unlimited). Keepalive
+	// frames count as traffic.
+	HijackedIdleTimeout time.Duration
+
+	// Dashboard Basic Auth throttling: after DashboardAuthMaxFailures failed
+	// attempts from one source, it is locked out for DashboardAuthLockout
+	// (0 = disabled).
+	DashboardAuthMaxFailures int
+	DashboardAuthLockout     time.Duration
+
+	// ReservedSubdomains are additional subdomains clients may not claim,
+	// on top of the built-in reservedSubdomains list.
+	ReservedSubdomains []string
 }
 
 // Server is the main structure of our tunnel server.
@@ -109,6 +135,9 @@ type Server struct {
 	// controlLimiter bounds control connections per source address; nil when both
 	// per-IP limits are disabled.
 	controlLimiter *ipLimiter
+	// dashAuth throttles repeated dashboard authentication failures per source
+	// address; nil when disabled.
+	dashAuth *authFailLimiter
 }
 
 // New creates a new server instance.
@@ -191,6 +220,7 @@ func New(config *Config) *Server {
 			config.ControlAttemptBurst,
 			config.ControlAttemptInterval,
 		),
+		dashAuth: newAuthFailLimiter(config.DashboardAuthMaxFailures, config.DashboardAuthLockout),
 	}
 }
 
@@ -422,10 +452,19 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 			http.Error(w, "Dashboard authentication is not configured.", http.StatusServiceUnavailable)
 			return
 		}
+		// Throttle repeated failures per source address: without this the
+		// endpoint is an unlimited online brute-force target.
+		key := limiterKeyFromString(r.RemoteAddr)
+		if !s.dashAuth.allow(key) {
+			w.Header().Set("Retry-After", strconv.FormatInt(int64(s.config.DashboardAuthLockout.Seconds()), 10))
+			http.Error(w, "Too many failed login attempts. Try again later.", http.StatusTooManyRequests)
+			return
+		}
 		user, pass, ok := r.BasicAuth()
-		userMatch := subtle.ConstantTimeCompare([]byte(user), []byte(s.config.DashboardUsername)) == 1
-		passMatch := subtle.ConstantTimeCompare([]byte(pass), []byte(s.config.DashboardPassword)) == 1
+		userMatch := constantTimeEqual(user, s.config.DashboardUsername)
+		passMatch := constantTimeEqual(pass, s.config.DashboardPassword)
 		if !ok || !userMatch || !passMatch {
+			s.dashAuth.recordFail(key)
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted Access"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte("Authentication required.\n"))
@@ -433,6 +472,16 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// constantTimeEqual compares two secrets in constant time without leaking their
+// length: both are hashed first, so the comparison always runs over 32
+// fixed-size bytes (subtle.ConstantTimeCompare returns immediately when the
+// lengths differ).
+func constantTimeEqual(a, b string) bool {
+	ha := sha256.Sum256([]byte(a))
+	hb := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
 }
 
 // securityHeaders adds security headers to HTTP responses.
@@ -473,6 +522,8 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	tunnels := s.snapshotTunnels()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// The page embeds the CSRF token: never let a shared cache store it.
+	w.Header().Set("Cache-Control", "no-store")
 	if err := s.dashboardTemplate.Execute(w, tunnels); err != nil {
 		log.Printf("Error executing dashboard template: %v", err)
 	}
@@ -569,7 +620,7 @@ func (s *Server) handleCloseTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Closing tunnel %s on dashboard request", tunnelID)
+	log.Printf("Closing tunnel %q on dashboard request", tunnelID)
 	s.closeTunnel(tunnel)
 
 	http.Redirect(w, r, "/", http.StatusFound)
@@ -743,6 +794,29 @@ func (c *prefixConn) CloseWrite() error {
 	return c.Conn.Close()
 }
 
+// activityConn records the time of the last bytes read or written, feeding the
+// idle watchdog of hijacked connections.
+type activityConn struct {
+	net.Conn
+	last *atomic.Int64
+}
+
+func (c *activityConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+func (c *activityConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
 // handleHijackedRequest manages protocols (WebSocket, SSE) that require
 // connection hijacking instead of a standard request/response cycle.
 // After hijacking, the raw TCP connection is proxied bidirectionally to the
@@ -752,7 +826,17 @@ func (c *prefixConn) CloseWrite() error {
 // for SSE.
 func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
-	log.Printf("%s request for host %s", protocol, host)
+	log.Printf("%s request for host %q", protocol, host)
+
+	if t.sem != nil {
+		select {
+		case t.sem <- struct{}{}:
+			defer func() { <-t.sem }()
+		default:
+			http.Error(w, "Too many concurrent requests for this tunnel.", http.StatusServiceUnavailable)
+			return
+		}
+	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -777,10 +861,27 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 	}
 	defer stream.Close()
 
+	// An idle timeout reaps hijacked connections whose peer goes silent in both
+	// directions; a dead peer would otherwise pin the connection and its stream
+	// forever. Keepalive frames (WebSocket ping/pong, SSE comments) count as
+	// traffic, so healthy connections are unaffected.
+	idleTimeout := s.config.HijackedIdleTimeout
+	var idleLast *atomic.Int64
+	streamConn := net.Conn(stream)
+	if idleTimeout > 0 {
+		idleLast = &atomic.Int64{}
+		idleLast.Store(time.Now().UnixNano())
+		streamConn = &activityConn{Conn: streamConn, last: idleLast}
+	}
+
+	// The visitor may carry spoofed X-Forwarded-* headers; the tunnel is the
+	// only hop in front of the backend, so overwrite them with the real values.
+	setForwardedHeaders(r)
+
 	// Write the request before starting the proxy to avoid a deadlock:
 	// the tunnel client needs the HTTP request before it can produce a response,
 	// and the proxy goroutines will start reading from both sides immediately.
-	if err := r.Write(stream); err != nil {
+	if err := r.Write(streamConn); err != nil {
 		log.Printf("Error writing %s request to stream: %v", protocol, err)
 		return
 	}
@@ -797,11 +898,38 @@ func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r
 		}
 	}
 
+	if idleLast != nil {
+		clientConn = &activityConn{Conn: clientConn, last: idleLast}
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			tick := idleTimeout / 2
+			if tick < time.Second {
+				tick = time.Second
+			}
+			ticker := time.NewTicker(tick)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					if idle := time.Since(time.Unix(0, idleLast.Load())); idle > idleTimeout {
+						log.Printf("%s connection for %s idle for %s, closing", protocol, host, idle.Round(time.Second))
+						clientConn.Close()
+						streamConn.Close()
+						return
+					}
+				}
+			}
+		}()
+	}
+
 	// Account traffic once, at the public boundary (clientConn). The stream relays
 	// the same bytes, so measuring it too would double every reported figure.
 	var ignoreIn, ignoreOut atomic.Uint64
 	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut)
-	mStream := tunnel_pkg.NewMeasuredConn(stream, &ignoreIn, &ignoreOut)
+	mStream := tunnel_pkg.NewMeasuredConn(streamConn, &ignoreIn, &ignoreOut)
 
 	log.Printf("Starting %s proxy for %s", protocol, host)
 	tunnel_pkg.Proxy(mClientConn, mStream)
@@ -831,6 +959,25 @@ func removeHopByHopHeaders(h http.Header) {
 	}
 }
 
+// setForwardedHeaders overwrites the forwarding headers with the values of the
+// public hop in front of the backend. The tunnel adds exactly one hop between
+// the visitor and the backend, so any X-Forwarded-* the visitor sent is spoofed
+// input and must not reach the backend.
+func setForwardedHeaders(r *http.Request) {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	proto := "http"
+	if r.TLS != nil {
+		proto = "https"
+	}
+	r.Header.Set("X-Forwarded-For", ip)
+	r.Header.Set("X-Real-IP", ip)
+	r.Header.Set("X-Forwarded-Proto", proto)
+	r.Header.Set("X-Forwarded-Host", r.Host)
+}
+
 // httpRoutingHost returns the key under which an HTTP tunnel is registered in
 // httpTunnels: the Host-header form (subdomain + domain host, lowercase, with any
 // port removed). ServeHTTP, setupHTTPTunnel, closeTunnel and cleanupTunnelsForSession
@@ -846,6 +993,15 @@ func httpRoutingHost(publicURL string) string {
 
 func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
+	if t.sem != nil {
+		select {
+		case t.sem <- struct{}{}:
+			defer func() { <-t.sem }()
+		default:
+			http.Error(w, "Too many concurrent requests for this tunnel.", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	if s.config.MaxHTTPRequestBytes > 0 && r.Body != nil {
 		// Fast-path reject a request whose declared size already exceeds the
 		// limit; MaxBytesReader below still guards chunked or under-declared
@@ -858,7 +1014,7 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	}
 	stream, err := t.Session.OpenStream()
 	if err != nil {
-		log.Printf("Unable to open stream for host %s: %v", host, err)
+		log.Printf("Unable to open stream for host %q: %v", host, err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -874,6 +1030,9 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	// backend should see (RFC 7230 6.1). Forwarding them lets a backend desync
 	// framing or poison downstream caches; mirror the response-side filtering.
 	removeHopByHopHeaders(r.Header)
+	// The visitor may carry spoofed X-Forwarded-* headers; the tunnel is the
+	// only hop in front of the backend, so overwrite them with the real values.
+	setForwardedHeaders(r)
 
 	// Relay the request in the background so the backend's response can be read
 	// and forwarded as soon as it is produced. A backend that answers early
@@ -1034,7 +1193,7 @@ func (s *Server) serveControlStream(session *yamux.Session, ctrlStream net.Conn)
 				log.Printf("Error handling tunnel request: %v", err)
 			}
 		default:
-			log.Printf("Received unhandled message type: %s", msg.Type)
+			log.Printf("Received unhandled message type: %q", msg.Type)
 		}
 	}
 }
@@ -1150,7 +1309,7 @@ func (s *Server) handleRequestTunnel(msg *protocol.ControlMessage, session *yamu
 		return fmt.Errorf("error unmarshaling RequestTunnel payload: %w", err)
 	}
 
-	log.Printf("Received request for tunnel type '%s' from %s", req.Type, session.RemoteAddr())
+	log.Printf("Received request for tunnel type %q from %s", req.Type, session.RemoteAddr())
 
 	if s.config.MaxTunnelsPerSession > 0 {
 		if n := s.countTunnelsForSession(session); n >= s.config.MaxTunnelsPerSession {
@@ -1183,10 +1342,11 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	// Validate a client-requested subdomain: it must be a single lowercase DNS label.
 	// Reject (rather than silently ignore) malformed input so a client cannot inject
 	// dots/uppercase/whitespace into the host key, shadow other labels, or desync the
-	// case-insensitive Host lookup. Empty means "assign a random one".
+	// case-insensitive Host lookup. Empty means "assign a random one". The reserved
+	// set is the built-in list plus the operator-configured ReservedSubdomains.
 	if req.Subdomain != "" {
 		normalized := strings.ToLower(req.Subdomain)
-		if !validSubdomain.MatchString(normalized) || reservedSubdomains[normalized] {
+		if !validSubdomain.MatchString(normalized) || reservedSubdomains[normalized] || slices.Contains(s.config.ReservedSubdomains, normalized) {
 			return sendTunnelError(ctrlStream, fmt.Sprintf("invalid or reserved subdomain: %q", req.Subdomain))
 		}
 		req.Subdomain = normalized
@@ -1221,6 +1381,13 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 		schema = "https"
 	}
 
+	// Bound concurrent public requests/hijacked connections per HTTP tunnel so a
+	// public flood cannot exhaust goroutines/streams on the server and the client.
+	var sem chan struct{}
+	if s.config.MaxHTTPConnsPerTunnel > 0 {
+		sem = make(chan struct{}, s.config.MaxHTTPConnsPerTunnel)
+	}
+
 	tunnel := &Tunnel{
 		ID:         uuid.New().String(),
 		Type:       "http",
@@ -1229,6 +1396,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 		Status:     "active",
 		CreatedAt:  time.Now(),
 		Session:    session,
+		sem:        sem,
 	}
 
 	s.tunnelsMu.Lock()
@@ -1392,7 +1560,7 @@ func (s *Server) authenticate(conn net.Conn) (net.Conn, bool) {
 	}
 
 	if msg.Type != protocol.AuthRequestType {
-		log.Printf("First message is not AuthRequest type, but %s", msg.Type)
+		log.Printf("First message is not AuthRequest type, but %q", msg.Type)
 		return conn, false
 	}
 
@@ -1404,7 +1572,7 @@ func (s *Server) authenticate(conn net.Conn) (net.Conn, bool) {
 
 	valid := false
 	for _, token := range s.config.ValidTokens {
-		if subtle.ConstantTimeCompare([]byte(token), []byte(authReq.AuthToken)) == 1 {
+		if constantTimeEqual(token, authReq.AuthToken) {
 			valid = true
 			break
 		}

@@ -58,19 +58,32 @@ max_control_conns_per_ip: 32
 control_attempt_burst: 20
 control_attempt_interval: "500ms"
 
-# Public HTTP server read/write timeouts. Default "0s" = unlimited, which suits large
-# uploads/downloads through the tunnel. Set non-zero (e.g. "60s") to harden against
-# slow-body / slow-read clients when your tunnels only carry small payloads.
-http_read_timeout: "0s"
-http_write_timeout: "0s"
+# Public HTTP server read/write timeouts. The built-in defaults (60s / 5m) harden
+# against slow-body / slow-read clients; set "0s" for unlimited when your tunnels
+# carry large uploads/downloads.
+http_read_timeout: "60s"
+http_write_timeout: "5m"
 
 # Max time for the tunnel client to deliver the response headers of a proxied HTTP
 # request. The response body is exempt and may stream without limit. Protects the
 # server from stalled backends pinning goroutines/streams forever. "0s" = unlimited.
 http_response_header_timeout: "30s"
 
-# Max public HTTP request body size in bytes (0 = unlimited).
-max_http_request_bytes: 0
+# Max public HTTP request body size in bytes (0 = unlimited). Default: 100 MiB.
+max_http_request_bytes: 104857600
+
+# Max concurrent public requests/hijacked connections per HTTP tunnel (0 = unlimited).
+max_http_conns_per_tunnel: 256
+
+# Reap hijacked (WebSocket/SSE) connections with no traffic in either direction for
+# this long. Keepalive frames count as traffic. "0s" = unlimited.
+hijacked_idle_timeout: "30m"
+
+# Additional subdomains clients may not claim (on top of the reserved
+# www/admin/dashboard). Use this to keep sensitive names off the public domain.
+reserved_subdomains:
+  - "api"
+  - "mail"
 
 # --- Status Dashboard Configuration ---
 
@@ -82,6 +95,11 @@ dashboard_addr: ":4040"
 # unauthenticated. Use a strong password.
 dashboard_username: "admin"
 dashboard_password: "change-me"
+
+# Dashboard auth throttling: lock a source out for dashboard_auth_lockout after
+# this many failed Basic Auth attempts (0 = disabled).
+dashboard_auth_max_failures: 5
+dashboard_auth_lockout: "1m"
 
 # (Optional) Paths for dashboard TLS files. If omitted, the dashboard will use HTTP.
 # If not found, they will be automatically generated.

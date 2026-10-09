@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 // ConfigYAML reflects the structure of the config.client.yml file
@@ -35,7 +35,7 @@ func main() {
 	// Flag definitions
 	configPath := flag.String("config", "config.client.yml", "Path to the client YAML configuration file")
 	serverAddr := flag.String("server", "", "Tunnel server address (overrides config)")
-	authToken := flag.String("token", "", "Authentication token (overrides config)")
+	authToken := flag.String("token", "", "Authentication token (overrides config; SOTTOPASSO_AUTH_TOKEN env is used when omitted)")
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (overrides config)")
 	tunnelType := flag.String("proto", "", "Protocol to forward (http or tcp, overrides config)")
 	localPort := flag.Int("port", 0, "Local port to expose (overrides config)")
@@ -99,6 +99,12 @@ func main() {
 		if err := yaml.Unmarshal(yamlFile, &configYAML); err != nil {
 			log.Fatalf("Error parsing YAML file %s: %v", *configPath, err)
 		}
+	}
+
+	// Keep the token off the command line (visible in the process list and shell
+	// history): fall back to the environment before applying the override.
+	if *authToken == "" {
+		*authToken = os.Getenv("SOTTOPASSO_AUTH_TOKEN")
 	}
 
 	// Override configuration with flags if provided
