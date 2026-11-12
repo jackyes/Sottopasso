@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base32"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -24,7 +25,6 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -138,6 +138,10 @@ type Server struct {
 	// dashAuth throttles repeated dashboard authentication failures per source
 	// address; nil when disabled.
 	dashAuth *authFailLimiter
+	// reserved holds every subdomain clients may not claim: the built-in
+	// reservedSubdomains plus Config.ReservedSubdomains, lowercased and trimmed
+	// to match the normalized form requests are compared in.
+	reserved map[string]bool
 }
 
 // New creates a new server instance.
@@ -209,7 +213,18 @@ func New(config *Config) *Server {
 		},
 	}).Parse(dashboardTemplate))
 
+	reserved := make(map[string]bool, len(reservedSubdomains)+len(config.ReservedSubdomains))
+	for name := range reservedSubdomains {
+		reserved[name] = true
+	}
+	for _, name := range config.ReservedSubdomains {
+		if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+			reserved[name] = true
+		}
+	}
+
 	return &Server{
+		reserved:          reserved,
 		config:            config,
 		tunnels:           make(map[string]*Tunnel),
 		httpTunnels:       make(map[string]*Tunnel),
@@ -1295,6 +1310,21 @@ var reservedSubdomains = map[string]bool{
 	"dashboard": true,
 }
 
+// randomSubdomainEncoding renders random bytes as a DNS label: lowercase
+// base32 (a-z, 2-7) without padding, 5 bits per character.
+var randomSubdomainEncoding = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
+
+// randomSubdomain returns a random 16-character subdomain carrying 80 bits of
+// entropy. The 404 for unknown hosts tells a scanner whether a guess hit a
+// tunnel, so the old 8 hex characters (32 bits) were enumerable; at 80 bits
+// guessing is out of reach. The URL is still not a secret (it ends up in
+// logs, browser history and Referer headers), so backends must authenticate.
+func randomSubdomain() string {
+	b := make([]byte, 10)
+	rand.Read(b) // never returns an error; crashes the program on failure instead
+	return randomSubdomainEncoding.EncodeToString(b)
+}
+
 // sendTunnelError reports a tunnel-setup failure to the client over the control
 // stream and returns the same message as an error for server-side logging.
 func sendTunnelError(ctrlStream net.Conn, errMsg string) error {
@@ -1349,7 +1379,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 	// set is the built-in list plus the operator-configured ReservedSubdomains.
 	if req.Subdomain != "" {
 		normalized := strings.ToLower(req.Subdomain)
-		if !validSubdomain.MatchString(normalized) || reservedSubdomains[normalized] || slices.Contains(s.config.ReservedSubdomains, normalized) {
+		if !validSubdomain.MatchString(normalized) || s.reserved[normalized] {
 			return sendTunnelError(ctrlStream, fmt.Sprintf("invalid or reserved subdomain: %q", req.Subdomain))
 		}
 		req.Subdomain = normalized
@@ -1371,7 +1401,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 
 	if host == "" {
 		for {
-			subdomain = uuid.New().String()[:8]
+			subdomain = randomSubdomain()
 			host = fmt.Sprintf("%s.%s", subdomain, routingDomain)
 			if _, exists := s.httpTunnels[host]; !exists {
 				break

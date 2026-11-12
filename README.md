@@ -168,6 +168,8 @@ INFO[...] Public tunnel available at: http://<random-string>.localhost:8001
 INFO[...] Forwarding to: localhost:3000
 ```
 
+The random subdomain is 16 characters long (80 bits), so tunnels cannot be found by guessing. The URL is still not a secret: it ends up in logs, browser history and `Referer` headers, and anyone who has it can reach the service. A service exposed through a tunnel must do its own authentication.
+
 **Example 2: Expose a local SSH service on port 22**
 
 ```bash
