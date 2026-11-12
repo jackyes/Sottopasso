@@ -185,6 +185,12 @@ func main() {
 		ReservedSubdomains:       configYAML.ReservedSubdomains,
 	}
 
+	// Refuse to start with guessable secrets or a dashboard that would send its
+	// password in clear text over the network.
+	if err := config.Validate(); err != nil {
+		log.Fatalf("Invalid configuration:\n%v", err)
+	}
+
 	srv := server.New(config)
 
 	quit := make(chan os.Signal, 1)

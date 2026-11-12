@@ -20,7 +20,8 @@ tls_cert_file: "/etc/letsencrypt/live/example.com/fullchain.pem"
 tls_key_file: "/etc/letsencrypt/live/example.com/privkey.pem"
 
 # List of valid authentication tokens for clients.
-# Generate strong random tokens (e.g., openssl rand -hex 32).
+# Generate strong random tokens (e.g., openssl rand -hex 32). The server refuses to
+# start with an empty token, one shorter than 32 characters, or this placeholder.
 valid_tokens:
   - "your-secret-token-here"
 
@@ -87,12 +88,16 @@ reserved_subdomains:
 
 # --- Status Dashboard Configuration ---
 
-# Address for the status dashboard (e.g., ":4040")
-dashboard_addr: ":4040"
+# Address for the status dashboard. Leave empty to disable it.
+# Without the TLS files below the dashboard is plain HTTP, and the server refuses to
+# start unless it listens on loopback only (127.0.0.1, [::1] or localhost): reach it
+# through an SSH tunnel (ssh -L 4040:127.0.0.1:4040 your-server) or a VPN. To listen
+# on a public interface such as ":4040", configure dashboard TLS.
+dashboard_addr: "127.0.0.1:4040"
 
 # Credentials for dashboard Basic Auth. BOTH are REQUIRED whenever dashboard_addr is
-# set: if either is empty the dashboard refuses to start and is never served
-# unauthenticated. Use a strong password.
+# set, and the server refuses to start without them. The password must be at least
+# 12 characters long and must not be this placeholder.
 dashboard_username: "admin"
 dashboard_password: "change-me"
 
@@ -101,7 +106,8 @@ dashboard_password: "change-me"
 dashboard_auth_max_failures: 5
 dashboard_auth_lockout: "1m"
 
-# (Optional) Paths for dashboard TLS files. If omitted, the dashboard will use HTTP.
-# If not found, they will be automatically generated.
+# (Optional) Paths for dashboard TLS files: set both or neither. If omitted, the
+# dashboard uses HTTP (loopback only, see dashboard_addr). If not found, they will be
+# automatically generated.
 # dashboard_tls_cert_file: "/etc/letsencrypt/live/example.com/fullchain.pem"
 # dashboard_tls_key_file: "/etc/letsencrypt/live/example.com/privkey.pem"

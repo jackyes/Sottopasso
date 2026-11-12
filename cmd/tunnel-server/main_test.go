@@ -113,3 +113,30 @@ func TestServerCLI_InvalidDuration(t *testing.T) {
 		t.Errorf("want keepalive duration error; got:\n%s", out)
 	}
 }
+
+// The server must refuse to start with the example configuration's secrets,
+// before it binds any listener.
+func TestServerCLI_RejectsExampleSecrets(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "weak.yml")
+	content := "control_addr: \"127.0.0.1:0\"\n" +
+		"valid_tokens:\n  - \"your-secret-token-here\"\n" +
+		"dashboard_addr: \":4040\"\n" +
+		"dashboard_username: \"admin\"\n" +
+		"dashboard_password: \"change-me\"\n"
+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := runServer(t, "-config", cfg)
+	if code == 0 {
+		t.Errorf("expected non-zero exit for example secrets; output:\n%s", out)
+	}
+	for _, want := range []string{"Invalid configuration", "valid_tokens[0]", "dashboard_password", "no TLS"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not mention %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "listening on") {
+		t.Errorf("server started a listener despite the invalid configuration:\n%s", out)
+	}
+}

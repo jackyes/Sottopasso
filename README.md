@@ -62,21 +62,24 @@ domain: "localhost:8001"
 tls_cert_file: "cert.pem"
 tls_key_file: "key.pem"
 
-# List of valid authentication tokens for clients
+# List of valid authentication tokens for clients: at least 32 characters each.
+# Generate them with: openssl rand -hex 32
 valid_tokens:
-  - "secret-token-1"
-  - "secret-token-2"
+  - "<output of openssl rand -hex 32>"
 
 # --- Status Dashboard Configuration ---
 
-# Address for the status dashboard (e.g., ":4040"). Leave empty to disable.
+# Address for the status dashboard. Leave empty to disable.
+# Without TLS it may only listen on loopback (see below).
 dashboard_addr: ":4040"
 
-# (Optional) Credentials to protect dashboard access with Basic Auth
+# Credentials for dashboard Basic Auth, required whenever dashboard_addr is set.
+# The password must be at least 12 characters long.
 dashboard_username: "admin"
-dashboard_password: "sottopasso"
+dashboard_password: "<a strong password>"
 
-# (Optional) Paths for dashboard TLS files. If omitted, the dashboard will be HTTP.
+# Paths for dashboard TLS files: set both or neither. Without them the dashboard is
+# plain HTTP and must listen on loopback (e.g. dashboard_addr: "127.0.0.1:4040").
 # If not found, they will be automatically generated.
 dashboard_tls_cert_file: "dashboard.cert.pem"
 dashboard_tls_key_file: "dashboard.key.pem"
@@ -92,8 +95,8 @@ Create this file in the same directory as the `tunnel-client.exe` executable.
 # Address of the server to connect to (TLS connection)
 server_addr: "127.0.0.1:8080"
 
-# Authentication token to use for the connection
-auth_token: "secret-token-1"
+# Authentication token to use for the connection (one of the server's valid_tokens)
+auth_token: "<one of the server's valid_tokens>"
 
 # If true, the client will not verify the validity of the server's TLS certificate.
 # REQUIRED for development with self-signed certificates.
@@ -184,4 +187,14 @@ bind address.
 
 ### 3. Access the Dashboard
 
-Open your browser and go to the configured address (e.g., `https://localhost:4040`). You will be prompted for the credentials defined in `config.server.yml` (`admin`/`sottopasso` in the example). You will see a table with all active tunnels and their traffic, which updates every 5 seconds.
+Open your browser and go to the configured address (e.g., `https://localhost:4040`). You will be prompted for the `dashboard_username` and `dashboard_password` defined in `config.server.yml`. You will see a table with all active tunnels and their traffic, which updates every 5 seconds.
+
+If the dashboard runs without TLS it listens on loopback only, so reach it from your machine through an SSH tunnel:
+
+```bash
+ssh -L 4040:127.0.0.1:4040 your-server
+```
+
+and then open `http://127.0.0.1:4040`.
+
+The server refuses to start when a token is empty, shorter than 32 characters or one of the documentation's placeholders, when the dashboard password is shorter than 12 characters or a placeholder, or when a dashboard without TLS would listen on a network interface. The error lists every problem it found.
