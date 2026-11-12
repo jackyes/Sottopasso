@@ -17,11 +17,11 @@ import (
 	"time"
 )
 
-// --- ServeHTTP: SSE dispatch ---
+// --- ServeHTTP: SSE ---
 
-// An SSE request (GET with Accept: text/event-stream) must be routed through the
-// hijack proxy path so the streamed response reaches the public client.
-func TestServeHTTP_SSEDispatch(t *testing.T) {
+// An SSE request goes through the regular proxy path; the event stream must
+// still reach the public client intact.
+func TestServeHTTP_SSEResponseReachesVisitor(t *testing.T) {
 	s := New(&Config{Domain: "localhost"})
 	serverSess, clientSess := newYamuxPair(t)
 	tun := &Tunnel{ID: "sse", Type: "http", PublicURL: "http://127.0.0.1", Status: "active", CreatedAt: time.Now(), Session: serverSess}
@@ -63,29 +63,23 @@ func TestServeHTTP_SSEDispatch(t *testing.T) {
 
 	fmt.Fprint(conn, "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n")
 
-	br := bufio.NewReader(conn)
-	status, err := br.ReadString('\n')
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
-		t.Fatalf("reading status line: %v", err)
+		t.Fatalf("reading response: %v", err)
 	}
-	if !strings.Contains(status, "200") {
-		t.Fatalf("status line=%q, want 200", status)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
 	}
-	for { // drain headers
-		line, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatalf("reading headers: %v", err)
-		}
-		if line == "\r\n" {
-			break
-		}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type=%q, want text/event-stream", ct)
 	}
-	data, err := br.ReadString('\n')
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("reading SSE data: %v", err)
 	}
-	if !strings.Contains(data, "data: hello") {
-		t.Errorf("SSE payload=%q, want it to contain 'data: hello'", data)
+	if string(data) != "data: hello\n\n" {
+		t.Errorf("SSE payload=%q, want %q", data, "data: hello\n\n")
 	}
 	if err := <-clientErr; err != nil {
 		t.Errorf("tunnel client side error: %v", err)
@@ -456,7 +450,7 @@ func TestServeDashboard_POSTDispatchesToCloseTunnel(t *testing.T) {
 // A WebSocket/SSE upgrade can only be served if the ResponseWriter supports
 // hijacking. httptest.NewRecorder() does not, so the server must fail with 500
 // instead of panicking.
-func TestHandleHijackedRequest_NonHijackerReturns500(t *testing.T) {
+func TestServeHTTP_WebSocketWithoutHijackerReturns500(t *testing.T) {
 	s := New(&Config{Domain: "localhost"})
 	sess, _ := newYamuxPair(t)
 	tun := &Tunnel{ID: "x", Type: "http", PublicURL: "http://h", Session: sess, Status: "active", CreatedAt: time.Now()}

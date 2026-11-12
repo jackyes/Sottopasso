@@ -109,29 +109,28 @@ func TestIsWebSocketRequest(t *testing.T) {
 	}
 }
 
-func TestIsSSERequest(t *testing.T) {
+// Event streams are recognized from the backend's response, never from the
+// visitor's Accept header.
+func TestIsEventStream(t *testing.T) {
 	cases := []struct {
-		name     string
-		method   string
-		accept   string
-		expected bool
+		contentType string
+		expected    bool
 	}{
-		{"sse get", "GET", "text/event-stream", true},
-		{"sse among others", "GET", "text/html, text/event-stream", true},
-		{"post is not sse", "POST", "text/event-stream", false},
-		{"get without sse accept", "GET", "text/html", false},
-		{"get no accept", "GET", "", false},
+		{"text/event-stream", true},
+		{"text/event-stream; charset=utf-8", true},
+		{"Text/Event-Stream", true},
+		{"text/html", false},
+		{"text/event-streamx", false},
+		{"", false},
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			r := httptest.NewRequest(c.method, "/", nil)
-			if c.accept != "" {
-				r.Header.Set("Accept", c.accept)
-			}
-			if got := isSSERequest(r); got != c.expected {
-				t.Errorf("isSSERequest=%v, want %v", got, c.expected)
-			}
-		})
+		h := http.Header{}
+		if c.contentType != "" {
+			h.Set("Content-Type", c.contentType)
+		}
+		if got := isEventStream(h); got != c.expected {
+			t.Errorf("isEventStream(%q)=%v, want %v", c.contentType, got, c.expected)
+		}
 	}
 }
 
@@ -294,10 +293,10 @@ func TestServeHTTP_ProxiesRequestAndCountsBytes(t *testing.T) {
 	}
 }
 
-// Exercises the hijack proxy path (WebSocket/SSE). Uses a real httptest.Server
-// so the ResponseWriter supports http.Hijacker, then verifies the raw
-// bidirectional proxy relays the upgrade response and subsequent frames.
-func TestHandleHijackedRequest_WebSocketProxy(t *testing.T) {
+// Exercises the WebSocket upgrade path. Uses a real httptest.Server so the
+// ResponseWriter supports http.Hijacker, then verifies that after the backend's
+// 101 the raw bidirectional proxy relays the upgrade response and frames.
+func TestServeHTTP_WebSocketProxy(t *testing.T) {
 	s := New(&Config{Domain: "localhost"})
 	serverSess, clientSess := newYamuxPair(t)
 	tun := &Tunnel{
@@ -403,7 +402,7 @@ func TestHandleHijackedRequest_WebSocketProxy(t *testing.T) {
 // A transparent proxy must forward ALL bytes the client sent, including any data
 // pipelined immediately after the upgrade request (which the HTTP server buffers
 // while parsing headers). This guards against discarding the hijacked buffer.
-func TestHandleHijackedRequest_ForwardsBufferedClientData(t *testing.T) {
+func TestServeHTTP_WebSocketForwardsBufferedClientData(t *testing.T) {
 	s := New(&Config{Domain: "localhost"})
 	serverSess, clientSess := newYamuxPair(t)
 	tun := &Tunnel{ID: "ws2", Type: "http", PublicURL: "http://127.0.0.1", Status: "active", CreatedAt: time.Now(), Session: serverSess}

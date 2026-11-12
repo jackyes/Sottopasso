@@ -5,6 +5,7 @@ import (
 	tunnel_pkg "Sottopasso/pkg/tunnel"
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -21,6 +22,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -107,9 +109,9 @@ type Config struct {
 	// per HTTP tunnel (0 = unlimited).
 	MaxHTTPConnsPerTunnel int
 
-	// HijackedIdleTimeout reaps hijacked (WebSocket/SSE) connections with no
-	// traffic in either direction for this long (0 = unlimited). Keepalive
-	// frames count as traffic.
+	// HijackedIdleTimeout closes WebSocket connections with no traffic in either
+	// direction, and SSE responses whose backend sends nothing, for this long
+	// (0 = unlimited). Keepalive frames and SSE comments count as traffic.
 	HijackedIdleTimeout time.Duration
 
 	// Dashboard Basic Auth throttling: after DashboardAuthMaxFailures failed
@@ -434,10 +436,10 @@ func (s *Server) startHTTPListener() {
 		ReadTimeout:       s.config.HTTPReadTimeout,
 		WriteTimeout:      s.config.HTTPWriteTimeout,
 		IdleTimeout:       120 * time.Second,
-		// Disable HTTP/2: the WebSocket/SSE paths rely on http.Hijacker, which
-		// the h2 ResponseWriter does not implement — h2 clients would get 500s
-		// on every SSE request. A non-nil empty map suppresses the automatic
-		// h2 configuration of ListenAndServeTLS.
+		// Disable HTTP/2: WebSocket upgrades rely on http.Hijacker, which the h2
+		// ResponseWriter does not implement (WebSocket over h2 would need
+		// RFC 8441 extended CONNECT). A non-nil empty map suppresses the
+		// automatic h2 configuration of ListenAndServeTLS.
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 	s.serversMu.Lock()
@@ -766,31 +768,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if isWebSocketRequest(r) {
-		s.handleHijackedRequest("WebSocket", w, r, t)
-		return
-	}
-
-	if isSSERequest(r) {
-		s.handleHijackedRequest("SSE", w, r, t)
-		return
-	}
-
-	// Handle normal HTTP requests
+	// Every request, WebSocket and SSE included, goes through the proxy: only a
+	// WebSocket upgrade the backend accepts with 101 turns into a raw stream.
 	s.handleHTTPRequest(w, r, t)
 }
 
 func isWebSocketRequest(r *http.Request) bool {
-	// The method check matters beyond RFC 6455 pedantry: the hijack path has no
-	// body-size limit or deadlines, so without it any POST carrying Upgrade
-	// headers would bypass MaxHTTPRequestBytes and the HTTP timeouts entirely.
+	// The method check matters beyond RFC 6455 pedantry: after a 101 the
+	// connection is a raw stream with no body-size limit or HTTP deadlines.
 	return r.Method == http.MethodGet &&
 		strings.ToLower(r.Header.Get("Upgrade")) == "websocket" &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
-func isSSERequest(r *http.Request) bool {
-	return r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+// isEventStream reports whether a response is a Server-Sent Events stream.
+// It looks at what the backend answered, never at the request: anyone can
+// send Accept: text/event-stream.
+func isEventStream(h http.Header) bool {
+	mediaType, _, err := mime.ParseMediaType(h.Get("Content-Type"))
+	return err == nil && mediaType == "text/event-stream"
 }
 
 // prefixConn is a net.Conn that returns a prefix of already-buffered bytes
@@ -819,7 +815,7 @@ func (c *prefixConn) CloseWrite() error {
 }
 
 // activityConn records the time of the last bytes read or written, feeding the
-// idle watchdog of hijacked connections.
+// idle watchdog of upgraded connections.
 type activityConn struct {
 	net.Conn
 	last *atomic.Int64
@@ -841,124 +837,42 @@ func (c *activityConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// handleHijackedRequest manages protocols (WebSocket, SSE) that require
-// connection hijacking instead of a standard request/response cycle.
-// After hijacking, the raw TCP connection is proxied bidirectionally to the
-// tunnel client. The tunnel client is responsible for producing the full HTTP
-// response (status line + headers + body), including protocol-specific headers
-// such as Upgrade/Connection for WebSocket or Content-Type: text/event-stream
-// for SSE.
-func (s *Server) handleHijackedRequest(protocol string, w http.ResponseWriter, r *http.Request, t *Tunnel) {
-	host := r.Host
-	log.Printf("%s request for host %q", protocol, host)
-
-	if t.sem != nil {
-		select {
-		case t.sem <- struct{}{}:
-			defer func() { <-t.sem }()
-		default:
-			http.Error(w, "Too many concurrent requests for this tunnel.", http.StatusServiceUnavailable)
-			return
-		}
+// CloseWrite forwards a half-close, like prefixConn.CloseWrite.
+func (c *activityConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
 	}
-
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		log.Printf("Unable to hijack connection for %s", protocol)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	clientConn, bufrw, err := hijacker.Hijack()
-	if err != nil {
-		log.Printf("Hijack failed for %s: %v", protocol, err)
-		return
-	}
-	defer clientConn.Close()
-	// Detach from the http.Server's Read/WriteTimeout: hijacked WebSocket/SSE
-	// connections are long-lived and must not be reaped by those deadlines.
-	clientConn.SetDeadline(time.Time{})
-
-	stream, err := t.Session.OpenStream()
-	if err != nil {
-		log.Printf("Unable to open stream for %s request to %s: %v", protocol, host, err)
-		return
-	}
-	defer stream.Close()
-
-	// An idle timeout reaps hijacked connections whose peer goes silent in both
-	// directions; a dead peer would otherwise pin the connection and its stream
-	// forever. Keepalive frames (WebSocket ping/pong, SSE comments) count as
-	// traffic, so healthy connections are unaffected.
-	idleTimeout := s.config.HijackedIdleTimeout
-	var idleLast *atomic.Int64
-	streamConn := net.Conn(stream)
-	if idleTimeout > 0 {
-		idleLast = &atomic.Int64{}
-		idleLast.Store(time.Now().UnixNano())
-		streamConn = &activityConn{Conn: streamConn, last: idleLast}
-	}
-
-	// The visitor may carry spoofed X-Forwarded-* headers; the tunnel is the
-	// only hop in front of the backend, so overwrite them with the real values.
-	setForwardedHeaders(r)
-
-	// Write the request before starting the proxy to avoid a deadlock:
-	// the tunnel client needs the HTTP request before it can produce a response,
-	// and the proxy goroutines will start reading from both sides immediately.
-	if err := r.Write(streamConn); err != nil {
-		log.Printf("Error writing %s request to stream: %v", protocol, err)
-		return
-	}
-
-	// The HTTP server may have buffered bytes the client sent immediately after
-	// the request (e.g. an early WebSocket frame) while parsing the headers.
-	// Recover them from the hijacked reader so they are forwarded rather than lost.
-	if bufrw != nil {
-		if n := bufrw.Reader.Buffered(); n > 0 {
-			buffered := make([]byte, n)
-			if _, err := io.ReadFull(bufrw.Reader, buffered); err == nil {
-				clientConn = &prefixConn{Conn: clientConn, prefix: buffered}
-			}
-		}
-	}
-
-	if idleLast != nil {
-		clientConn = &activityConn{Conn: clientConn, last: idleLast}
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			tick := idleTimeout / 2
-			if tick < time.Second {
-				tick = time.Second
-			}
-			ticker := time.NewTicker(tick)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-done:
-					return
-				case <-ticker.C:
-					if idle := time.Since(time.Unix(0, idleLast.Load())); idle > idleTimeout {
-						log.Printf("%s connection for %s idle for %s, closing", protocol, host, idle.Round(time.Second))
-						clientConn.Close()
-						streamConn.Close()
-						return
-					}
-				}
-			}
-		}()
-	}
-
-	// Account traffic once, at the public boundary (clientConn). The stream relays
-	// the same bytes, so measuring it too would double every reported figure.
-	var ignoreIn, ignoreOut atomic.Uint64
-	mClientConn := tunnel_pkg.NewMeasuredConn(clientConn, &t.TotalBytesIn, &t.TotalBytesOut)
-	mStream := tunnel_pkg.NewMeasuredConn(streamConn, &ignoreIn, &ignoreOut)
-
-	log.Printf("Starting %s proxy for %s", protocol, host)
-	tunnel_pkg.Proxy(mClientConn, mStream)
-	log.Printf("%s proxy for %s terminated", protocol, host)
+	return c.Conn.Close()
 }
+
+// errResponseHeadersTooLarge reports a response whose status line and headers
+// exceed maxResponseHeaderBytes.
+var errResponseHeadersTooLarge = errors.New("response headers exceed maximum size")
+
+// headerLimitReader bounds the bytes read through it until disarm is called.
+// It sits under the bufio.Reader that parses a response, so only the header
+// part is limited and the body can be of any size.
+type headerLimitReader struct {
+	r         io.Reader
+	remaining int64 // negative once disarmed
+}
+
+func (l *headerLimitReader) Read(p []byte) (int, error) {
+	if l.remaining < 0 {
+		return l.r.Read(p)
+	}
+	if l.remaining == 0 {
+		return 0, errResponseHeadersTooLarge
+	}
+	if int64(len(p)) > l.remaining {
+		p = p[:l.remaining]
+	}
+	n, err := l.r.Read(p)
+	l.remaining -= int64(n)
+	return n, err
+}
+
+func (l *headerLimitReader) disarm() { l.remaining = -1 }
 
 // hopByHopHeaders are connection-specific and must not be forwarded to the public
 // client (RFC 7230 6.1). Forwarding them lets a backend desync framing or poison
@@ -1015,8 +929,27 @@ func httpRoutingHost(publicURL string) string {
 	return strings.ToLower(host)
 }
 
+// publicHost returns the host[:port] of a tunnel's public URL: the Host the
+// backend sees, whatever case or port the visitor's Host header used (routing
+// ignores both).
+func publicHost(t *Tunnel) string {
+	host := strings.TrimPrefix(t.PublicURL, "http://")
+	return strings.TrimPrefix(host, "https://")
+}
+
 func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tunnel) {
 	host := r.Host
+	// A WebSocket upgrade needs the visitor's connection once the backend has
+	// accepted it; find out now that it cannot be had, before the backend sees
+	// the request.
+	upgrade := isWebSocketRequest(r)
+	if upgrade {
+		if _, ok := w.(http.Hijacker); !ok {
+			log.Printf("Unable to hijack connection for WebSocket request to %q", host)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
 	if t.sem != nil {
 		select {
 		case t.sem <- struct{}{}:
@@ -1042,6 +975,9 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	// Each request gets a stream of its own, closed with the response: the
+	// visitor's next request on the same connection comes back through
+	// ServeHTTP, so it is routed and its headers are rewritten again.
 	defer stream.Close()
 
 	mStream := tunnel_pkg.NewMeasuredConn(stream, &t.TotalBytesOut, &t.TotalBytesIn)
@@ -1054,6 +990,15 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	// backend should see (RFC 7230 6.1). Forwarding them lets a backend desync
 	// framing or poison downstream caches; mirror the response-side filtering.
 	removeHopByHopHeaders(r.Header)
+	if upgrade {
+		// The upgrade request itself is hop-by-hop; put back exactly the one
+		// isWebSocketRequest accepted.
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Upgrade", "websocket")
+	}
+	if h := publicHost(t); h != "" {
+		r.Host = h
+	}
 	// The visitor may carry spoofed X-Forwarded-* headers; the tunnel is the
 	// only hop in front of the backend, so overwrite them with the real values.
 	setForwardedHeaders(r)
@@ -1080,12 +1025,14 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		stream.SetReadDeadline(time.Now().Add(d))
 	}
 
-	// Read the HTTP response from the tunnel stream. Interim 1xx responses
-	// (e.g. 103 Early Hints) are skipped: unlike http.Transport, ReadResponse
-	// returns them as if they were final. 101 is excluded — after "Switching
-	// Protocols" the stream no longer carries HTTP. The iteration cap keeps a
-	// misbehaving backend from spinning this loop.
-	br := bufio.NewReader(mStream)
+	// Read the HTTP response from the tunnel stream, with its headers bounded:
+	// the tunnel client chooses these bytes. Interim 1xx responses (e.g. 103
+	// Early Hints) are skipped: unlike http.Transport, ReadResponse returns them
+	// as if they were final. 101 is excluded — after "Switching Protocols" the
+	// stream no longer carries HTTP. The iteration cap keeps a misbehaving
+	// backend from spinning this loop.
+	headerLimit := &headerLimitReader{r: mStream, remaining: maxResponseHeaderBytes}
+	br := bufio.NewReader(headerLimit)
 	resp, err := http.ReadResponse(br, r)
 	for i := 0; err == nil && resp.StatusCode >= 100 && resp.StatusCode < 200 &&
 		resp.StatusCode != http.StatusSwitchingProtocols && i < 5; i++ {
@@ -1113,6 +1060,11 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 			}
 			return
 		}
+		if errors.Is(err, errResponseHeadersTooLarge) {
+			log.Printf("Response headers from the tunnel client for %q exceed %d bytes", host, maxResponseHeaderBytes)
+			http.Error(w, "Bad gateway: the tunnel client sent oversized response headers.", http.StatusBadGateway)
+			return
+		}
 		// Nothing has been written to w yet, so a clean 502 is safe. Returning
 		// without a status would make net/http send an implicit empty 200, and a
 		// dead backend would look healthy to the visitor.
@@ -1122,6 +1074,7 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		http.Error(w, "Bad gateway: the tunnel client did not return a response.", http.StatusBadGateway)
 		return
 	}
+	headerLimit.disarm()
 
 	// The iteration cap above keeps a misbehaving backend from spinning the loop;
 	// a response that is still interim here means the cap was hit. Fail rather
@@ -1134,6 +1087,23 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 	defer resp.Body.Close()
 
 	stream.SetReadDeadline(time.Time{})
+
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		// A switch the visitor did not ask for, or to another protocol, would
+		// hand the visitor's connection to the backend as a raw stream.
+		if !upgrade {
+			log.Printf("Tunnel client for %q switched protocols without an upgrade request", host)
+			http.Error(w, "Bad gateway: unexpected protocol switch.", http.StatusBadGateway)
+			return
+		}
+		if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
+			log.Printf("Tunnel client for %q switched to %q instead of websocket", host, resp.Header.Get("Upgrade"))
+			http.Error(w, "Bad gateway: unexpected protocol switch.", http.StatusBadGateway)
+			return
+		}
+		s.relayUpgrade(w, host, resp, br, mStream)
+		return
+	}
 
 	// The backend (the tunnel client's own service) controls the remaining response
 	// headers, including Set-Cookie/CORS/Location for its own public hostname — that is
@@ -1159,15 +1129,156 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 		w.Header().Set("Trailer", strings.Join(names, ", "))
 	}
 
-	// Write the status code and the response body
+	// An event stream stays open far longer than the public server's timeouts,
+	// which are sized for ordinary requests. Lift them for this response only —
+	// the backend chose to answer with an event stream — and let the idle
+	// timeout reap a stream that goes silent instead.
+	var idle time.Duration
+	eventStream := isEventStream(resp.Header)
+	if eventStream {
+		rc := http.NewResponseController(w)
+		rc.SetReadDeadline(time.Time{})
+		rc.SetWriteDeadline(time.Time{})
+		idle = s.config.HijackedIdleTimeout
+		// Without a read pending on the visitor's side, its departure is only
+		// seen through the request context: close the stream then, or a silent
+		// backend would keep it until the idle timeout.
+		stop := context.AfterFunc(r.Context(), func() { stream.Close() })
+		defer stop()
+	}
+
+	// Write the status code and the response body. A body of unknown length is
+	// flushed as it arrives, so streamed responses (SSE, long polling, chunked
+	// APIs) reach the visitor without waiting for the response buffer to fill.
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if eventStream || resp.ContentLength == -1 {
+		copyFlushing(w, resp.Body, stream, idle)
+	} else {
+		io.Copy(w, resp.Body)
+	}
 	for name, values := range resp.Trailer {
 		for _, value := range values {
 			w.Header().Add(name, value)
 		}
 	}
 }
+
+// copyFlushing copies src to w, flushing after every write. When idle is
+// positive, a read from stream that waits longer than idle ends the copy.
+func copyFlushing(w http.ResponseWriter, src io.Reader, stream net.Conn, idle time.Duration) {
+	rc := http.NewResponseController(w)
+	buf := make([]byte, 32<<10)
+	for {
+		if idle > 0 {
+			stream.SetReadDeadline(time.Now().Add(idle))
+		}
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if ferr := rc.Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// relayUpgrade completes a WebSocket upgrade the backend accepted: it sends the
+// 101 to the visitor and joins the visitor's connection and the stream into a
+// raw bidirectional proxy. br is the reader the 101 was parsed from; anything
+// it holds past the headers already belongs to the new protocol.
+func (s *Server) relayUpgrade(w http.ResponseWriter, host string, resp *http.Response, br *bufio.Reader, mStream *tunnel_pkg.MeasuredConn) {
+	clientConn, bufrw, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Printf("Hijack failed for WebSocket to %q: %v", host, err)
+		return
+	}
+	defer clientConn.Close()
+	// Detach from the http.Server's Read/WriteTimeout: WebSocket connections are
+	// long-lived and must not be reaped by those deadlines.
+	clientConn.SetDeadline(time.Time{})
+
+	// Relay the 101 with the backend's own headers (Sec-WebSocket-Accept,
+	// subprotocol, extensions), hop-by-hop ones reduced to the upgrade itself.
+	removeHopByHopHeaders(resp.Header)
+	resp.Header.Set("Connection", "Upgrade")
+	resp.Header.Set("Upgrade", "websocket")
+	resp.Body = nil
+	if err := resp.Write(bufrw); err != nil {
+		log.Printf("Error writing WebSocket upgrade response for %q: %v", host, err)
+		return
+	}
+	if err := bufrw.Flush(); err != nil {
+		log.Printf("Error writing WebSocket upgrade response for %q: %v", host, err)
+		return
+	}
+
+	// Bytes already buffered on either side belong to the new protocol: the
+	// backend's first frames sent right after its 101, and anything the visitor
+	// sent right after its request.
+	var backendConn net.Conn = mStream
+	if n := br.Buffered(); n > 0 {
+		buffered, _ := br.Peek(n)
+		backendConn = &prefixConn{Conn: mStream, prefix: bytes.Clone(buffered)}
+	}
+	var visitorConn net.Conn = clientConn
+	if n := bufrw.Reader.Buffered(); n > 0 {
+		buffered, _ := bufrw.Reader.Peek(n)
+		visitorConn = &prefixConn{Conn: clientConn, prefix: bytes.Clone(buffered)}
+	}
+
+	// An idle timeout reaps connections whose peers go silent in both
+	// directions; a dead peer would otherwise pin the connection and its stream
+	// forever. Keepalive frames (ping/pong) count as traffic, so healthy
+	// connections are unaffected.
+	if idleTimeout := s.config.HijackedIdleTimeout; idleTimeout > 0 {
+		idleLast := &atomic.Int64{}
+		idleLast.Store(time.Now().UnixNano())
+		visitorConn = &activityConn{Conn: visitorConn, last: idleLast}
+		backendConn = &activityConn{Conn: backendConn, last: idleLast}
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			tick := idleTimeout / 2
+			if tick < time.Second {
+				tick = time.Second
+			}
+			ticker := time.NewTicker(tick)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					if idle := time.Since(time.Unix(0, idleLast.Load())); idle > idleTimeout {
+						log.Printf("WebSocket connection for %s idle for %s, closing", host, idle.Round(time.Second))
+						clientConn.Close()
+						mStream.Close()
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Traffic is already accounted on mStream, which carried the request and
+	// the 101 and now carries the raw stream: measuring the visitor side too
+	// would double every reported figure.
+	var ignoreIn, ignoreOut atomic.Uint64
+	tunnel_pkg.Proxy(
+		tunnel_pkg.NewMeasuredConn(visitorConn, &ignoreIn, &ignoreOut),
+		tunnel_pkg.NewMeasuredConn(backendConn, &ignoreIn, &ignoreOut),
+	)
+}
+
+// maxResponseHeaderBytes bounds the status line and headers of a response read
+// from the tunnel client, interim 1xx responses included. It matches
+// http.DefaultMaxHeaderBytes, the limit net/http applies to request headers.
+const maxResponseHeaderBytes = 1 << 20 // 1 MiB
 
 // maxControlMessageSize bounds the bytes a single control message may occupy on the wire.
 const maxControlMessageSize = 1 << 20 // 1 MiB
@@ -1253,6 +1364,18 @@ func (s *Server) handleClientConnection(conn net.Conn) {
 		return
 	}
 	defer ctrlStream.Close()
+
+	// The control stream is the only one a client may open; every other stream
+	// is opened by the server, one per public connection. A stream nobody
+	// accepts sits in yamux's backlog while its receive buffer fills up, so a
+	// client that opens one is cut off rather than left to pile them up.
+	go func() {
+		if extra, err := session.AcceptStream(); err == nil {
+			log.Printf("Client %s opened an unexpected stream; closing its session", conn.RemoteAddr())
+			extra.Close()
+			session.Close()
+		}
+	}()
 
 	log.Printf("Control stream accepted from %s. Waiting for requests...", conn.RemoteAddr())
 

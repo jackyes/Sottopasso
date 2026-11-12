@@ -82,8 +82,9 @@ max_http_request_bytes: 104857600
 # Max concurrent public requests/hijacked connections per HTTP tunnel (0 = unlimited).
 max_http_conns_per_tunnel: 256
 
-# Reap hijacked (WebSocket/SSE) connections with no traffic in either direction for
-# this long. Keepalive frames count as traffic. "0s" = unlimited.
+# Close WebSocket connections with no traffic in either direction, and SSE responses
+# whose backend sends nothing, for this long. WebSocket ping/pong frames and SSE
+# comments count as traffic. "0s" = unlimited.
 hijacked_idle_timeout: "30m"
 
 # Additional subdomains clients may not claim (on top of the reserved

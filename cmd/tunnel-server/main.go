@@ -51,8 +51,8 @@ type ConfigYAML struct {
 	// Max concurrent public requests/hijacked connections per HTTP tunnel (0 = unlimited).
 	MaxHTTPConnsPerTunnel int `yaml:"max_http_conns_per_tunnel"`
 
-	// Reap hijacked (WebSocket/SSE) connections with no traffic in either
-	// direction for this long. "0s" = unlimited.
+	// Close WebSocket connections idle in both directions, and SSE responses
+	// whose backend sends nothing, for this long. "0s" = unlimited.
 	HijackedIdleTimeout string `yaml:"hijacked_idle_timeout"`
 
 	// Dashboard auth throttling: lock a source out for dashboard_auth_lockout
