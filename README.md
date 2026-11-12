@@ -20,7 +20,7 @@ The application consists of two components:
 
 ## Compilation
 
-You need to have **Go (version 1.18 or later)** installed.
+You need **Go 1.27.4 or later** (the minimum set by `go.mod`; older Go releases have known vulnerabilities in the standard library). With the default `GOTOOLCHAIN=auto`, an older `go` command downloads the required toolchain automatically.
 
 1.  Clone the repository or download the files into a directory.
 2.  Open a terminal in the main project directory.

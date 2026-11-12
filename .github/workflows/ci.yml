@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly run: new Go and dependency advisories are published without any
+    # change to this repository, so govulncheck must re-run on its own.
+    - cron: '0 6 * * 1'
+
+# Least privilege for GITHUB_TOKEN: the jobs only read the repository.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -14,12 +22,15 @@ jobs:
       - name: Checkout
         # Pinned to a commit SHA, not a mutable major tag.
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         # Pinned to a commit SHA, not a mutable major tag.
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.25'
+          # Single source of truth for the toolchain: the go directive in go.mod.
+          go-version-file: go.mod
 
       - name: Go vet
         run: go vet ./...
@@ -29,3 +40,27 @@ jobs:
 
       - name: Build
         run: go build ./...
+
+  security:
+    name: Static analysis & vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # Pinned to a commit SHA, not a mutable major tag.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        # Pinned to a commit SHA, not a mutable major tag.
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        # Exact version: tools run from CI are pinned like actions are.
+        # Covers the standard library of the toolchain above, not only modules.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
