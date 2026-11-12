@@ -45,7 +45,7 @@ max_control_connections: 512
 # Per-source-address control-channel limits. max_control_connections above is a single
 # global budget, so on its own it does not stop one peer from taking all of it: a control
 # connection holds its slot for the whole session, and an unauthenticated one holds it
-# for the full 10s authentication deadline. IPv6 sources are grouped by /64, since a
+# for up to control_auth_timeout (below). IPv6 sources are grouped by /64, since a
 # single peer is usually handed a whole /64.
 #
 # max_control_conns_per_ip caps concurrent connections per source. Raise it if many
@@ -58,6 +58,12 @@ max_control_conns_per_ip: 32
 # Set either to 0 to disable the rate limit (the concurrency cap above still applies).
 control_attempt_burst: 20
 control_attempt_interval: "500ms"
+
+# Max time for a new control connection to complete the TLS handshake and send a valid
+# token. Each connection still in this window holds a control slot, so a short value
+# makes the slots much harder to exhaust. Raise it only for clients on very slow or
+# lossy links. Must be positive.
+control_auth_timeout: "3s"
 
 # Public HTTP server read/write timeouts. The built-in defaults (60s / 5m) harden
 # against slow-body / slow-read clients; set "0s" for unlimited when your tunnels

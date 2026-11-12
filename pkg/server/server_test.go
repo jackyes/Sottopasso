@@ -1134,3 +1134,42 @@ func TestGetTLSConfig_GeneratesWhenMissing(t *testing.T) {
 		t.Errorf("getTLSConfig on existing files: %v", err)
 	}
 }
+
+func TestControlAuthTimeout_DefaultsWhenUnset(t *testing.T) {
+	if got := New(&Config{}).controlAuthTimeout(); got != defaultControlAuthTimeout {
+		t.Errorf("controlAuthTimeout()=%s, want default %s", got, defaultControlAuthTimeout)
+	}
+	if got := New(&Config{ControlAuthTimeout: 7 * time.Second}).controlAuthTimeout(); got != 7*time.Second {
+		t.Errorf("controlAuthTimeout()=%s, want configured 7s", got)
+	}
+	if defaultControlAuthTimeout > 5*time.Second {
+		t.Errorf("defaultControlAuthTimeout=%s: an unauthenticated peer would hold a control slot too long", defaultControlAuthTimeout)
+	}
+}
+
+// A peer that connects and sends nothing must lose its control slot once
+// ControlAuthTimeout expires.
+func TestAuthenticate_SilentPeerTimesOut(t *testing.T) {
+	s := New(&Config{ValidTokens: []string{"good-token"}, ControlAuthTimeout: 100 * time.Millisecond})
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+
+	done := make(chan bool, 1)
+	start := time.Now()
+	go func() {
+		_, ok := s.authenticate(serverSide)
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("silent peer authenticated")
+		}
+		if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+			t.Errorf("gave up after %s, before the %s timeout", elapsed, 100*time.Millisecond)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("authenticate did not time out a silent peer")
+	}
+}

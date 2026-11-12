@@ -140,3 +140,19 @@ func TestServerCLI_RejectsExampleSecrets(t *testing.T) {
 		t.Errorf("server started a listener despite the invalid configuration:\n%s", out)
 	}
 }
+
+func TestServerCLI_RejectsNonPositiveAuthTimeout(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "auth.yml")
+	content := "control_addr: \"127.0.0.1:0\"\ncontrol_auth_timeout: \"0s\"\n"
+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := runServer(t, "-config", cfg)
+	if code == 0 {
+		t.Errorf("expected non-zero exit for control_auth_timeout 0s; output:\n%s", out)
+	}
+	if !strings.Contains(out, "control_auth_timeout must be positive") {
+		t.Errorf("want control_auth_timeout error; got:\n%s", out)
+	}
+}

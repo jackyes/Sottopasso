@@ -91,6 +91,12 @@ type Config struct {
 	ControlAttemptBurst    int           // control connection attempts a source may make back-to-back (0 = no rate limit)
 	ControlAttemptInterval time.Duration // one attempt is restored every interval (0 = no rate limit)
 
+	// ControlAuthTimeout bounds the TLS handshake plus the authentication
+	// message on a new control connection (0 = defaultControlAuthTimeout).
+	// Every connection still in this window holds a control slot, so it is the
+	// time a peer can occupy one without a valid token.
+	ControlAuthTimeout time.Duration
+
 	// HTTPResponseHeaderTimeout bounds the round-trip with the tunnel client for a
 	// proxied HTTP request: relaying the request plus reading the response headers.
 	// It does not apply to the response body, which may stream indefinitely.
@@ -1577,10 +1583,26 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 	return nil
 }
 
+// defaultControlAuthTimeout is the ControlAuthTimeout used when none is set.
+// A client completes the handshake and sends its token in one or two round
+// trips, so a few seconds leave ample margin even on slow links, while keeping
+// short the time an unauthenticated peer can hold a control slot.
+const defaultControlAuthTimeout = 3 * time.Second
+
+// controlAuthTimeout returns the effective ControlAuthTimeout.
+func (s *Server) controlAuthTimeout() time.Duration {
+	if s.config.ControlAuthTimeout > 0 {
+		return s.config.ControlAuthTimeout
+	}
+	return defaultControlAuthTimeout
+}
+
 // authenticate handles the authentication flow.
 func (s *Server) authenticate(conn net.Conn) (net.Conn, bool) {
-	// Set a deadline to prevent clients from holding connections open without authenticating
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	// Set a deadline to prevent clients from holding connections open without
+	// authenticating. On a TLS connection it also bounds the handshake, which
+	// runs on the first Read.
+	conn.SetReadDeadline(time.Now().Add(s.controlAuthTimeout()))
 	defer conn.SetReadDeadline(time.Time{}) // Clear deadline after auth
 
 	// Keep the decoder so any bytes it buffers past the auth message can be handed to

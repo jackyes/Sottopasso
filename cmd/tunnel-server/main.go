@@ -40,6 +40,10 @@ type ConfigYAML struct {
 	ControlAttemptBurst    int    `yaml:"control_attempt_burst"`
 	ControlAttemptInterval string `yaml:"control_attempt_interval"`
 
+	// Max time for a new control connection to complete the TLS handshake and
+	// authenticate.
+	ControlAuthTimeout string `yaml:"control_auth_timeout"`
+
 	// Max time for the tunnel client to deliver the response headers of a proxied
 	// HTTP request (the body may then stream without limit). "0s" = unlimited.
 	HTTPResponseHeaderTimeout string `yaml:"http_response_header_timeout"`
@@ -82,6 +86,7 @@ func main() {
 	configYAML.MaxControlConnsPerIP = 32
 	configYAML.ControlAttemptBurst = 20
 	configYAML.ControlAttemptInterval = "500ms"
+	configYAML.ControlAuthTimeout = "3s"
 	configYAML.HTTPReadTimeout = "60s"
 	configYAML.HTTPWriteTimeout = "5m"
 	configYAML.HTTPResponseHeaderTimeout = "30s"
@@ -150,6 +155,16 @@ func main() {
 		log.Fatalf("Invalid control_attempt_interval format: %v", err)
 	}
 
+	controlAuthTimeout, err := time.ParseDuration(configYAML.ControlAuthTimeout)
+	if err != nil {
+		log.Fatalf("Invalid control_auth_timeout format: %v", err)
+	}
+	// Unlike the limits above, this one cannot be turned off: without it an
+	// unauthenticated peer could hold a control slot forever.
+	if controlAuthTimeout <= 0 {
+		log.Fatalf("control_auth_timeout must be positive, got %q", configYAML.ControlAuthTimeout)
+	}
+
 	config := &server.Config{
 		ControlAddr:            configYAML.ControlAddr,
 		HTTPAddr:               configYAML.HTTPAddr,
@@ -175,6 +190,7 @@ func main() {
 		MaxControlConnsPerIP:   configYAML.MaxControlConnsPerIP,
 		ControlAttemptBurst:    configYAML.ControlAttemptBurst,
 		ControlAttemptInterval: controlAttemptInterval,
+		ControlAuthTimeout:     controlAuthTimeout,
 
 		HTTPResponseHeaderTimeout: httpResponseHeaderTimeout,
 
