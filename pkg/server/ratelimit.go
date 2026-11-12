@@ -228,7 +228,7 @@ type authFailEntry struct {
 
 // authFailLimiter throttles repeated authentication failures per source key:
 // once a key records maxFails failures within window, it is locked out for
-// lockout and every request from it is refused before credentials are checked.
+// lockout and every request from it is refused, whatever its credentials.
 // A nil *authFailLimiter enforces nothing, so callers need no nil checks.
 type authFailLimiter struct {
 	mu        sync.Mutex
@@ -257,8 +257,16 @@ func newAuthFailLimiter(maxFails int, lockout time.Duration) *authFailLimiter {
 	}
 }
 
-// allow reports whether a request from key may proceed to credential checking.
-func (l *authFailLimiter) allow(key string) bool {
+// attempt records the outcome of one credential check from key and reports
+// whether the request may be answered with that outcome. It reports false
+// while key is locked out, in which case the caller must refuse the request
+// without revealing whether the credentials were right.
+//
+// Checking the lockout and counting the failure happen in one critical
+// section. With a separate check before the credentials and a record after
+// them, parallel requests could all pass the check before any of their
+// failures was counted.
+func (l *authFailLimiter) attempt(key string, failed bool) bool {
 	if l == nil {
 		return true
 	}
@@ -267,37 +275,17 @@ func (l *authFailLimiter) allow(key string) bool {
 	now := l.now()
 	l.sweepLocked(now)
 	e := l.entries[key]
-	return e == nil || e.lockedUntil.IsZero() || !now.Before(e.lockedUntil)
-}
-
-// recordFail registers one failed authentication attempt from key.
-func (l *authFailLimiter) recordFail(key string) {
-	if l == nil {
-		return
+	if e != nil {
+		l.expireLocked(e, now)
+		if !e.lockedUntil.IsZero() {
+			return false
+		}
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.now()
-	l.sweepLocked(now)
-	e := l.entries[key]
+	if !failed {
+		return true
+	}
 	if e == nil {
-		if len(l.entries) >= maxTrackedIPs {
-			l.sweepLocked(now)
-		}
-		if len(l.entries) >= maxTrackedIPs {
-			// Fail open here: the table is full of recently-failed sources,
-			// and refusing would lock out legitimate clients sharing the
-			// address space behind a rotating attacker.
-			l.evictOldestLocked(now)
-		}
-		e = &authFailEntry{}
-		l.entries[key] = e
-	}
-	if !e.lockedUntil.IsZero() {
-		return // already locked out; a new failure does not extend the lockout
-	}
-	if now.Sub(e.windowStart) > l.window {
-		e.fails = 0
+		e = l.addLocked(key)
 	}
 	if e.fails == 0 {
 		e.windowStart = now
@@ -309,19 +297,54 @@ func (l *authFailLimiter) recordFail(key string) {
 		e.windowStart = time.Time{}
 		log.Printf("Auth limiter: locked out %s for %s after %d failed attempts", key, l.lockout, l.maxFails)
 	}
+	return true
 }
 
-// sweepLocked drops entries whose window or lockout has expired. Throttled to
-// once per ipLimiterSweepInterval: it is called on the request path.
+// expireLocked resets whatever part of e has run out: after an expired
+// lockout or failure window the entry counts from zero again. Doing this on
+// every access, not only in the throttled sweep, is what makes a failure right
+// after a lockout count: an expired lockout left on the entry used to make
+// every failure be ignored until the next sweep removed it.
+func (l *authFailLimiter) expireLocked(e *authFailEntry, now time.Time) {
+	if !e.lockedUntil.IsZero() {
+		if now.Before(e.lockedUntil) {
+			return
+		}
+		e.lockedUntil = time.Time{}
+		e.fails = 0
+		e.windowStart = time.Time{}
+		return
+	}
+	if !e.windowStart.IsZero() && now.Sub(e.windowStart) > l.window {
+		e.fails = 0
+		e.windowStart = time.Time{}
+	}
+}
+
+// addLocked creates the entry for key, evicting the oldest one when the table
+// is full.
+func (l *authFailLimiter) addLocked(key string) *authFailEntry {
+	if len(l.entries) >= maxTrackedIPs {
+		// Fail open here: the table is full of recently-failed sources, and
+		// refusing would lock out legitimate clients sharing the address space
+		// behind a rotating attacker.
+		l.evictOldestLocked()
+	}
+	e := &authFailEntry{}
+	l.entries[key] = e
+	return e
+}
+
+// sweepLocked drops entries with nothing left to enforce. Throttled to once
+// per ipLimiterSweepInterval: it is called on the request path.
 func (l *authFailLimiter) sweepLocked(now time.Time) {
 	if now.Sub(l.lastSweep) < ipLimiterSweepInterval {
 		return
 	}
 	l.lastSweep = now
 	for key, e := range l.entries {
-		expired := !e.lockedUntil.IsZero() && !now.Before(e.lockedUntil)
-		expired = expired || (e.lockedUntil.IsZero() && !e.windowStart.IsZero() && now.Sub(e.windowStart) > l.window)
-		if expired {
+		l.expireLocked(e, now)
+		if e.lockedUntil.IsZero() && e.fails == 0 {
 			delete(l.entries, key)
 		}
 	}
@@ -329,7 +352,7 @@ func (l *authFailLimiter) sweepLocked(now time.Time) {
 
 // evictOldestLocked removes the entry with the oldest activity to make room
 // for a new key.
-func (l *authFailLimiter) evictOldestLocked(now time.Time) {
+func (l *authFailLimiter) evictOldestLocked() {
 	var oldestKey string
 	var oldest time.Time
 	found := false

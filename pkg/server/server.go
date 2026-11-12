@@ -452,19 +452,22 @@ func (s *Server) basicAuth(next http.Handler) http.Handler {
 			http.Error(w, "Dashboard authentication is not configured.", http.StatusServiceUnavailable)
 			return
 		}
+		user, pass, hasCreds := r.BasicAuth()
+		userMatch := constantTimeEqual(user, s.config.DashboardUsername)
+		passMatch := constantTimeEqual(pass, s.config.DashboardPassword)
+		valid := hasCreds && userMatch && passMatch
 		// Throttle repeated failures per source address: without this the
-		// endpoint is an unlimited online brute-force target.
+		// endpoint is an unlimited online brute-force target. The credentials
+		// are compared first so the lockout check and the failure count are a
+		// single step; during a lockout the outcome is never revealed. A
+		// request without credentials guesses nothing and is not counted.
 		key := limiterKeyFromString(r.RemoteAddr)
-		if !s.dashAuth.allow(key) {
+		if !s.dashAuth.attempt(key, hasCreds && !valid) {
 			w.Header().Set("Retry-After", strconv.FormatInt(int64(s.config.DashboardAuthLockout.Seconds()), 10))
 			http.Error(w, "Too many failed login attempts. Try again later.", http.StatusTooManyRequests)
 			return
 		}
-		user, pass, ok := r.BasicAuth()
-		userMatch := constantTimeEqual(user, s.config.DashboardUsername)
-		passMatch := constantTimeEqual(pass, s.config.DashboardPassword)
-		if !ok || !userMatch || !passMatch {
-			s.dashAuth.recordFail(key)
+		if !valid {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted Access"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte("Authentication required.\n"))
