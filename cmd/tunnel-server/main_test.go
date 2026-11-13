@@ -156,3 +156,19 @@ func TestServerCLI_RejectsNonPositiveAuthTimeout(t *testing.T) {
 		t.Errorf("want control_auth_timeout error; got:\n%s", out)
 	}
 }
+
+func TestServerCLI_InvalidTCPIdleTimeout(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "tcp.yml")
+	content := "control_addr: \"127.0.0.1:0\"\ntcp_idle_timeout: \"notaduration\"\n"
+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := runServer(t, "-config", cfg)
+	if code == 0 {
+		t.Errorf("expected non-zero exit for an invalid tcp_idle_timeout; output:\n%s", out)
+	}
+	if !strings.Contains(out, "Invalid tcp_idle_timeout") {
+		t.Errorf("want tcp_idle_timeout error; got:\n%s", out)
+	}
+}

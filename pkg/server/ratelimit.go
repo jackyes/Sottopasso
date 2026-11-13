@@ -110,7 +110,7 @@ func (l *ipLimiter) admit(key string) (ok bool, release func(), reason string) {
 	}
 
 	if l.maxActive > 0 && e.active >= l.maxActive {
-		return false, noop, fmt.Sprintf("per-IP concurrent control connection limit (%d) reached", l.maxActive)
+		return false, noop, fmt.Sprintf("per-IP concurrent connection limit (%d) reached", l.maxActive)
 	}
 	// A rejected attempt spends no token: the peer stays throttled at exactly the
 	// refill rate instead of being pushed further behind by its own retries.

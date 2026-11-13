@@ -87,6 +87,32 @@ max_http_conns_per_tunnel: 256
 # comments count as traffic. "0s" = unlimited.
 hijacked_idle_timeout: "30m"
 
+# --- Per-source limits on public traffic (0 = unlimited) ---
+#
+# The tunnel-wide limits above (max_http_conns_per_tunnel, max_conns_per_tunnel) are a
+# single budget per tunnel: without these, one host could hold all of it and make the
+# tunnel unreachable for everyone else. IPv6 sources are grouped by /64.
+#
+# IMPORTANT: these limits see the address the connection comes from. If the server sits
+# behind a reverse proxy or load balancer, every visitor shares the proxy's address:
+# set max_conns_per_ip_per_tunnel and max_public_conns_per_ip to 0 and enforce per-client
+# limits on the proxy instead.
+
+# Max concurrent requests (HTTP tunnels) or connections (TCP tunnels) per source on each
+# tunnel. A browser keeps at most 6 requests in flight per host; raise this if many
+# visitors of a tunnel share one public address (a NAT'd office).
+max_conns_per_ip_per_tunnel: 32
+
+# Close public TCP tunnel connections with no traffic in either direction for this long.
+# Interactive protocols that stay silent for long periods (SSH without keepalives)
+# need a higher value or client-side keepalives. "0s" = unlimited.
+tcp_idle_timeout: "1h"
+
+# Max connections open on the public HTTP listener, idle keep-alive ones included: in
+# all (keep it well below the process's file descriptor limit) and per source.
+max_public_conns: 10000
+max_public_conns_per_ip: 256
+
 # Additional subdomains clients may not claim (on top of the reserved
 # www/admin/dashboard). Use this to keep sensitive names off the public domain.
 reserved_subdomains:

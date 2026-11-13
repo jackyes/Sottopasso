@@ -57,6 +57,10 @@ type Tunnel struct {
 	// sem bounds concurrent public requests for an HTTP tunnel (nil = unlimited,
 	// or the tunnel is a TCP tunnel, whose limit lives in its accept loop).
 	sem chan struct{}
+
+	// perIP bounds the concurrent requests (HTTP) or connections (TCP) of each
+	// source address on this tunnel; nil = unlimited.
+	perIP *ipLimiter
 }
 
 // Config contains the server configuration.
@@ -114,6 +118,23 @@ type Config struct {
 	// (0 = unlimited). Keepalive frames and SSE comments count as traffic.
 	HijackedIdleTimeout time.Duration
 
+	// MaxConnsPerIPPerTunnel bounds, per tunnel and per source address, the
+	// concurrent public requests (HTTP) or connections (TCP), so a single
+	// source cannot take every slot of MaxHTTPConnsPerTunnel/MaxConnsPerTunnel
+	// (0 = unlimited). IPv6 sources are grouped by /64.
+	MaxConnsPerIPPerTunnel int
+
+	// TCPIdleTimeout closes a public TCP tunnel connection with no traffic in
+	// either direction for this long (0 = unlimited).
+	TCPIdleTimeout time.Duration
+
+	// MaxPublicConns and MaxPublicConnsPerIP bound the connections open on the
+	// public HTTP listener, in all and per source address (0 = unlimited).
+	// Idle keep-alive connections count, so these are what stop a single
+	// source from exhausting file descriptors or the listener.
+	MaxPublicConns      int
+	MaxPublicConnsPerIP int
+
 	// Dashboard Basic Auth throttling: after DashboardAuthMaxFailures failed
 	// attempts from one source, it is locked out for DashboardAuthLockout
 	// (0 = disabled).
@@ -150,6 +171,8 @@ type Server struct {
 	// reservedSubdomains plus Config.ReservedSubdomains, lowercased and trimmed
 	// to match the normalized form requests are compared in.
 	reserved map[string]bool
+	// publicLog throttles log lines that public visitors can trigger at will.
+	publicLog *throttledLog
 }
 
 // New creates a new server instance.
@@ -233,6 +256,7 @@ func New(config *Config) *Server {
 
 	return &Server{
 		reserved:          reserved,
+		publicLog:         newThrottledLog(time.Second),
 		config:            config,
 		tunnels:           make(map[string]*Tunnel),
 		httpTunnels:       make(map[string]*Tunnel),
@@ -439,29 +463,43 @@ func (s *Server) startHTTPListener() {
 		// Disable HTTP/2: WebSocket upgrades rely on http.Hijacker, which the h2
 		// ResponseWriter does not implement (WebSocket over h2 would need
 		// RFC 8441 extended CONNECT). A non-nil empty map suppresses the
-		// automatic h2 configuration of ListenAndServeTLS.
+		// automatic h2 configuration of ServeTLS.
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 	s.serversMu.Lock()
 	s.httpServer = srv
 	s.serversMu.Unlock()
 
+	var cfg *tls.Config
 	if s.config.HTTPUseTLS {
-		cfg, err := s.getTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile, "localhost")
+		var err error
+		cfg, err = s.getTLSConfig(s.config.TLSCertFile, s.config.TLSKeyFile, "localhost")
 		if err != nil {
 			log.Printf("Unable to get TLS configuration for HTTPS listener: %v", err)
 			return
 		}
 		srv.TLSConfig = cfg
+	}
+
+	ln, err := net.Listen("tcp", s.config.HTTPAddr)
+	if err != nil {
+		log.Printf("Fatal HTTP listener error: %v", err)
+		return
+	}
+	// Cap the connections open at once, idle keep-alive ones included: per
+	// source, so one host cannot take the listener; in all, so a crowd of hosts
+	// cannot exhaust the process's file descriptors.
+	ln = newLimitListener(ln, s.config.MaxPublicConns, s.config.MaxPublicConnsPerIP)
+
+	if cfg != nil {
 		log.Printf("HTTPS listener listening on %s", s.config.HTTPAddr)
-		if err := srv.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
-			log.Printf("Fatal HTTPS listener error: %v", err)
-		}
+		err = srv.ServeTLS(ln, "", "")
 	} else {
 		log.Printf("HTTP listener listening on %s", s.config.HTTPAddr)
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("Fatal HTTP listener error: %v", err)
-		}
+		err = srv.Serve(ln)
+	}
+	if err != http.ErrServerClosed {
+		log.Printf("Fatal HTTP listener error: %v", err)
 	}
 }
 
@@ -950,6 +988,15 @@ func (s *Server) handleHTTPRequest(w http.ResponseWriter, r *http.Request, t *Tu
 			return
 		}
 	}
+	// Per-source limit first: it is what keeps one source from taking the
+	// tunnel-wide budget checked right after.
+	admitted, releaseIP, reason := t.perIP.admit(limiterKeyFromString(r.RemoteAddr))
+	if !admitted {
+		s.publicLog.printf("Refusing request from %s to %q: %s", r.RemoteAddr, host, reason)
+		http.Error(w, "Too many concurrent requests from your address.", http.StatusTooManyRequests)
+		return
+	}
+	defer releaseIP()
 	if t.sem != nil {
 		select {
 		case t.sem <- struct{}{}:
@@ -1240,29 +1287,12 @@ func (s *Server) relayUpgrade(w http.ResponseWriter, host string, resp *http.Res
 		idleLast.Store(time.Now().UnixNano())
 		visitorConn = &activityConn{Conn: visitorConn, last: idleLast}
 		backendConn = &activityConn{Conn: backendConn, last: idleLast}
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			tick := idleTimeout / 2
-			if tick < time.Second {
-				tick = time.Second
-			}
-			ticker := time.NewTicker(tick)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-done:
-					return
-				case <-ticker.C:
-					if idle := time.Since(time.Unix(0, idleLast.Load())); idle > idleTimeout {
-						log.Printf("WebSocket connection for %s idle for %s, closing", host, idle.Round(time.Second))
-						clientConn.Close()
-						mStream.Close()
-						return
-					}
-				}
-			}
-		}()
+		stop := watchIdle(idleTimeout, idleLast, func(idle time.Duration) {
+			s.publicLog.printf("WebSocket connection for %s idle for %s, closing", host, idle.Round(time.Second))
+			clientConn.Close()
+			mStream.Close()
+		})
+		defer stop()
 	}
 
 	// Traffic is already accounted on mStream, which carried the request and
@@ -1559,6 +1589,7 @@ func (s *Server) setupHTTPTunnel(req protocol.RequestTunnel, session *yamux.Sess
 		CreatedAt:  time.Now(),
 		Session:    session,
 		sem:        sem,
+		perIP:      newIPLimiter(s.config.MaxConnsPerIPPerTunnel, 0, 0),
 	}
 
 	s.tunnelsMu.Lock()
@@ -1625,6 +1656,7 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 		CreatedAt:  time.Now(),
 		Session:    session,
 		listener:   listener,
+		perIP:      newIPLimiter(s.config.MaxConnsPerIPPerTunnel, 0, 0),
 	}
 
 	s.tunnelsMu.Lock()
@@ -1669,11 +1701,20 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 				return
 			}
 
+			// Per-source limit first: it is what keeps one source from taking
+			// the tunnel-wide budget checked right after.
+			admitted, releaseIP, reason := tunnel.perIP.admit(limiterKey(publicConn.RemoteAddr()))
+			if !admitted {
+				s.publicLog.printf("TCP tunnel %s: rejecting %s: %s", publicAddr, publicConn.RemoteAddr(), reason)
+				publicConn.Close()
+				continue
+			}
 			if sem != nil {
 				select {
 				case sem <- struct{}{}:
 				default:
-					log.Printf("TCP tunnel %s: per-tunnel connection limit (%d) reached; rejecting %s", publicAddr, s.config.MaxConnsPerTunnel, publicConn.RemoteAddr())
+					releaseIP()
+					s.publicLog.printf("TCP tunnel %s: per-tunnel connection limit (%d) reached; rejecting %s", publicAddr, s.config.MaxConnsPerTunnel, publicConn.RemoteAddr())
 					publicConn.Close()
 					continue
 				}
@@ -1681,10 +1722,11 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 
 			go func(publicConn net.Conn) {
 				defer publicConn.Close()
+				defer releaseIP()
 				if sem != nil {
 					defer func() { <-sem }()
 				}
-				log.Printf("Accepted public connection from %s, forwarding to client %s", publicConn.RemoteAddr(), session.RemoteAddr())
+				s.publicLog.printf("Accepted public connection from %s, forwarding to client %s", publicConn.RemoteAddr(), session.RemoteAddr())
 
 				stream, err := session.OpenStream()
 				if err != nil {
@@ -1693,11 +1735,28 @@ func (s *Server) setupTCPTunnel(req protocol.RequestTunnel, session *yamux.Sessi
 				}
 				defer stream.Close()
 
+				// Without traffic in either direction for TCPIdleTimeout the
+				// connection is closed: an idle one would otherwise hold its slots
+				// for as long as the visitor likes.
+				var visitorConn, streamConn net.Conn = publicConn, stream
+				if idleTimeout := s.config.TCPIdleTimeout; idleTimeout > 0 {
+					last := &atomic.Int64{}
+					last.Store(time.Now().UnixNano())
+					visitorConn = &activityConn{Conn: publicConn, last: last}
+					streamConn = &activityConn{Conn: stream, last: last}
+					stop := watchIdle(idleTimeout, last, func(idle time.Duration) {
+						s.publicLog.printf("TCP tunnel %s: connection from %s idle for %s, closing", publicAddr, publicConn.RemoteAddr(), idle.Round(time.Second))
+						publicConn.Close()
+						stream.Close()
+					})
+					defer stop()
+				}
+
 				// Account traffic once, at the public boundary. The stream relays the
 				// same bytes, so measuring it too would double every reported figure.
 				var ignoreIn, ignoreOut atomic.Uint64
-				mPublicConn := tunnel_pkg.NewMeasuredConn(publicConn, &tunnel.TotalBytesIn, &tunnel.TotalBytesOut)
-				mStream := tunnel_pkg.NewMeasuredConn(stream, &ignoreIn, &ignoreOut)
+				mPublicConn := tunnel_pkg.NewMeasuredConn(visitorConn, &tunnel.TotalBytesIn, &tunnel.TotalBytesOut)
+				mStream := tunnel_pkg.NewMeasuredConn(streamConn, &ignoreIn, &ignoreOut)
 
 				tunnel_pkg.Proxy(mPublicConn, mStream)
 			}(publicConn)

@@ -172,7 +172,9 @@ func TestServeHTTP_SSEEventsAreFlushedAsTheyArrive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadResponse: %v", err)
 	}
-	defer resp.Body.Close()
+	// No resp.Body.Close: on a client response it drains the body, which only
+	// ends once the deferred close(release) has run. The connection is closed
+	// by dialVisitor's cleanup instead.
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type=%q, want text/event-stream", ct)
 	}

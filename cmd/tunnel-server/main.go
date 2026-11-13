@@ -62,6 +62,19 @@ type ConfigYAML struct {
 
 	// Additional subdomains clients may not claim (on top of www/admin/dashboard).
 	ReservedSubdomains []string `yaml:"reserved_subdomains"`
+
+	// Max concurrent public requests (HTTP) or connections (TCP) per source
+	// address on each tunnel (0 = unlimited).
+	MaxConnsPerIPPerTunnel int `yaml:"max_conns_per_ip_per_tunnel"`
+
+	// Close public TCP tunnel connections idle in both directions for this
+	// long. "0s" = unlimited.
+	TCPIdleTimeout string `yaml:"tcp_idle_timeout"`
+
+	// Max connections open on the public HTTP listener, in all and per source
+	// address (0 = unlimited).
+	MaxPublicConns      int `yaml:"max_public_conns"`
+	MaxPublicConnsPerIP int `yaml:"max_public_conns_per_ip"`
 }
 
 func main() {
@@ -95,6 +108,10 @@ func main() {
 	configYAML.HijackedIdleTimeout = "30m"
 	configYAML.DashboardAuthMaxFailures = 5
 	configYAML.DashboardAuthLockout = "1m"
+	configYAML.MaxConnsPerIPPerTunnel = 32
+	configYAML.TCPIdleTimeout = "1h"
+	configYAML.MaxPublicConns = 10000
+	configYAML.MaxPublicConnsPerIP = 256
 	if err := yaml.Unmarshal(yamlFile, &configYAML); err != nil {
 		log.Fatalf("Error parsing YAML file: %v", err)
 	}
@@ -155,6 +172,11 @@ func main() {
 		log.Fatalf("Invalid control_attempt_interval format: %v", err)
 	}
 
+	tcpIdleTimeout, err := time.ParseDuration(configYAML.TCPIdleTimeout)
+	if err != nil {
+		log.Fatalf("Invalid tcp_idle_timeout format: %v", err)
+	}
+
 	controlAuthTimeout, err := time.ParseDuration(configYAML.ControlAuthTimeout)
 	if err != nil {
 		log.Fatalf("Invalid control_auth_timeout format: %v", err)
@@ -199,6 +221,10 @@ func main() {
 		DashboardAuthMaxFailures: configYAML.DashboardAuthMaxFailures,
 		DashboardAuthLockout:     dashboardAuthLockout,
 		ReservedSubdomains:       configYAML.ReservedSubdomains,
+		MaxConnsPerIPPerTunnel:   configYAML.MaxConnsPerIPPerTunnel,
+		TCPIdleTimeout:           tcpIdleTimeout,
+		MaxPublicConns:           configYAML.MaxPublicConns,
+		MaxPublicConnsPerIP:      configYAML.MaxPublicConnsPerIP,
 	}
 
 	// Refuse to start with guessable secrets or a dashboard that would send its

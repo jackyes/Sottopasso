@@ -85,6 +85,8 @@ dashboard_tls_cert_file: "dashboard.cert.pem"
 dashboard_tls_key_file: "dashboard.key.pem"
 ```
 
+Every resource limit and timeout has a protective default; `config.server.example.yml` lists them all. Several limits are per source address (control connections, requests and connections per tunnel, connections to the public HTTP listener), so that one host cannot make the server or a tunnel unreachable for others. **If the server runs behind a reverse proxy or load balancer**, all visitors share the proxy's address: set `max_conns_per_ip_per_tunnel` and `max_public_conns_per_ip` to `0` and enforce per-client limits on the proxy.
+
 ### Client (`config.client.yml`)
 
 Create this file in the same directory as the `tunnel-client.exe` executable.
